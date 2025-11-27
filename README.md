@@ -8,14 +8,16 @@ This script safely copies an Azure VM (regional or zonal) to a specified availab
 
 ### What the Script Does
 
-1. **Validates** the source VM, target resource group, and zone availability
-2. **Stops** the source VM for consistent snapshots
-3. **Creates incremental snapshots** of all disks (OS and data disks)
-4. **Creates new zonal disks** from the snapshots in the target resource group
-5. **Creates a new NIC** with all configurations copied from the source
-6. **Creates the new VM** in the target availability zone
-7. **Cleans up** temporary snapshots
-8. **Reports** any VM extensions that need manual installation
+1. **Validates** the source VM, target resource group, zone availability, and encryption status
+2. **Checks for Azure Disk Encryption (ADE)** and blocks if detected (ADE-encrypted disks cannot be copied)
+3. **Stops** the source VM for consistent snapshots
+4. **Creates incremental snapshots** of all disks (OS and data disks)
+5. **Creates new zonal disks** from the snapshots in the target resource group
+6. **Optionally converts disk SKUs** during migration (e.g., Premium to Standard)
+7. **Creates a new NIC** with all configurations copied from the source
+8. **Creates the new VM** in the target availability zone
+9. **Cleans up** temporary snapshots
+10. **Reports** any VM extensions that need manual installation
 
 ## Requirements
 
@@ -42,7 +44,7 @@ Install-Module -Name Az.Compute, Az.Network, Az.Resources -Scope CurrentUser
 ```powershell
 .\move-vmtozone.ps1 -ResourceGroupName <source-rg> -VMName <vm-name> `
     -TargetResourceGroupName <target-rg> -TargetZone <1|2|3> `
-    [-NewVMName <new-vm-name>] [-WhatIf]
+    [-NewVMName <new-vm-name>] [-TargetOsDiskSku <sku>] [-TargetDataDiskSku <sku>] [-WhatIf]
 ```
 
 ### Parameters
@@ -54,7 +56,21 @@ Install-Module -Name Az.Compute, Az.Network, Az.Resources -Scope CurrentUser
 | `TargetResourceGroupName` | Yes | The resource group where new resources will be created (must be different from source) |
 | `TargetZone` | Yes | The target availability zone (1, 2, or 3) |
 | `NewVMName` | No | Name for the new VM (defaults to same name as source) |
+| `TargetOsDiskSku` | No | SKU for the new OS disk (defaults to source SKU) |
+| `TargetDataDiskSku` | No | SKU for all new data disks (defaults to each source disk's SKU) |
 | `WhatIf` | No | Preview mode—shows what would happen without making changes |
+
+### Valid Disk SKU Values
+
+- `Standard_LRS` - Standard HDD
+- `StandardSSD_LRS` - Standard SSD (locally redundant)
+- `StandardSSD_ZRS` - Standard SSD (zone redundant)
+- `Premium_LRS` - Premium SSD (locally redundant)
+- `Premium_ZRS` - Premium SSD (zone redundant)
+- `PremiumV2_LRS` - Premium SSD v2 (requires `Caching='None'`)
+- `UltraSSD_LRS` - Ultra Disk (requires `Caching='None'`)
+
+> **Note:** When converting to `PremiumV2_LRS` or `UltraSSD_LRS`, the source disk must already have `Caching='None'` configured.
 
 ### Examples
 
@@ -70,6 +86,21 @@ Install-Module -Name Az.Compute, Az.Network, Az.Resources -Scope CurrentUser
 ```powershell
 .\move-vmtozone.ps1 -ResourceGroupName "my-source-rg" -VMName "my-vm" `
     -TargetResourceGroupName "my-target-rg" -TargetZone 1 -NewVMName "my-vm-zone1" -WhatIf
+```
+
+**Copy and convert OS disk to Premium SSD:**
+
+```powershell
+.\move-vmtozone.ps1 -ResourceGroupName "my-source-rg" -VMName "my-vm" `
+    -TargetResourceGroupName "my-target-rg" -TargetZone 2 -TargetOsDiskSku Premium_LRS
+```
+
+**Copy and convert all disks to Standard SSD:**
+
+```powershell
+.\move-vmtozone.ps1 -ResourceGroupName "my-source-rg" -VMName "my-vm" `
+    -TargetResourceGroupName "my-target-rg" -TargetZone 2 `
+    -TargetOsDiskSku StandardSSD_LRS -TargetDataDiskSku StandardSSD_LRS
 ```
 
 ### Prerequisites
@@ -88,23 +119,15 @@ Before running the script:
    New-AzResourceGroup -Name "my-target-rg" -Location "eastus"
    ```
 
-3. **Ensure the source NIC has Dynamic IP allocation.** If it has a static IP, change it first:
-
-   ```powershell
-   $nic = Get-AzNetworkInterface -Name "my-nic" -ResourceGroupName "my-source-rg"
-   $nic.IpConfigurations[0].PrivateIpAllocationMethod = 'Dynamic'
-   $nic.IpConfigurations[0].PrivateIpAddress = $null
-   $nic | Set-AzNetworkInterface
-   ```
-
 ## Features
 
 ### Preserved Configurations
 
 The script preserves the following from the source VM:
 
-- **Disk configurations:** SKU type, size, IOPS, throughput, tier, logical sector size
-- **Disk encryption:** Disk Encryption Set (DES) settings
+- **Disk configurations:** SKU type (or converted), size, IOPS, throughput, tier, logical sector size
+- **Disk Encryption Set (DES):** Server-side encryption with customer-managed keys
+- **Encryption at Host:** Host-based encryption setting
 - **NIC configurations:** Subnet, NSG, DNS settings, accelerated networking, IP forwarding
 - **Load balancer associations:** Backend pools, inbound NAT rules
 - **Application Gateway:** Backend pool associations
@@ -115,10 +138,24 @@ The script preserves the following from the source VM:
 - **Spot VM settings:** Priority, eviction policy, max price
 - **Proximity Placement Group:** If compatible with target zone
 
+### Disk SKU Conversion
+
+You can convert disk SKUs during migration:
+
+- Convert Standard HDD to Premium SSD for better performance
+- Convert Premium SSD to Standard SSD for cost savings
+- Convert to Zone-Redundant Storage (ZRS) for higher availability
+- Each disk type (OS vs data) can be converted independently
+
 ### Special Disk Handling
 
 - **Ultra Disks & Premium SSD v2:** Uses instant access snapshots for faster disk creation
 - **Caching validation:** Ensures Premium V2 and Ultra disks have `None` caching (Azure requirement)
+
+### Security Validations
+
+- **Azure Disk Encryption (ADE):** The script detects and blocks VMs encrypted with ADE (BitLocker/dm-crypt). ADE-encrypted disks cannot be copied to a new VM without becoming inaccessible.
+- **Encryption at Host:** This setting IS preserved and copied to the new VM.
 
 ### Proximity Placement Group (PPG) Support
 
@@ -132,13 +169,23 @@ The script intelligently handles PPGs:
 ## Limitations
 
 | Limitation | Details |
-|------------|---------|
+|------------|----------|
 | **Single NIC only** | VMs with multiple NICs are not supported |
 | **Different resource group required** | Target RG must be different from source RG |
-| **Dynamic IP required** | Source NIC must have Dynamic IP allocation |
-| **New IP address** | The new NIC will receive a different IP from Azure |
+| **New IP address** | New VM will have a different IP than the source |
 | **No Public IP copy** | Public IPs are not copied (must be attached manually) |
 | **No VM extensions** | Extensions are not automatically installed on the new VM |
+| **No ADE support** | VMs with Azure Disk Encryption (BitLocker/dm-crypt) are blocked |
+
+## IP Address Handling
+
+The new VM will receive a **different IP address** assigned dynamically by Azure:
+
+- The source NIC keeps its IP address (source resources are NOT modified)
+- The new NIC gets a new dynamic IP from the same subnet
+- You may need to update DNS records or firewall rules after migration
+
+> **Note:** IP preservation is not possible without modifying the source NIC. Since this script prioritizes keeping source resources unchanged, the new VM will have a different IP.
 
 ## Output
 
@@ -146,6 +193,7 @@ The script provides detailed progress information and a final summary showing:
 
 - Source VM and resource details (unchanged)
 - New VM and resource details (created)
+- Disk SKUs (original and converted if applicable)
 - List of extensions that need manual installation
 - Important notes about the operation
 
@@ -154,7 +202,7 @@ The script provides detailed progress information and a final summary showing:
 1. **Verify the new VM** is working correctly
 2. **Install any required extensions** on the new VM
 3. **Attach Public IPs** if needed
-4. **Update DNS records** or load balancer configurations as needed
+4. **Update DNS records or firewall rules** with the new IP address
 5. **Delete the source VM** and its resources when satisfied
 
 ## Troubleshooting
@@ -170,8 +218,14 @@ The script provides detailed progress information and a final summary showing:
 **"VM size not available in zone"**
 - Choose a different target zone or resize the VM before migration
 
-**"Source NIC must have Dynamic IP allocation"**
-- Change the source NIC to use Dynamic IP (see Prerequisites)
+**"Azure Disk Encryption (ADE) detected"**
+- ADE-encrypted disks cannot be copied. Options:
+  - Disable ADE on the source VM first (Windows data disks, Linux data disks)
+  - For Linux OS disks with ADE, create a new VM with a fresh OS disk
+  - Consider migrating to "Encryption at Host" instead of ADE
+
+**"Caching must be 'None' for Premium V2 / Ultra disks"**
+- Change the source disk caching to `None` before running the script, or choose a different target SKU
 
 **"Snapshot timeout"**
 - For large disks, the script may take longer; it will retry automatically
