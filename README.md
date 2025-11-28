@@ -1,23 +1,24 @@
 # Azure VM Zonal Copy Script
 
-A PowerShell script that creates a copy of an Azure VM in a target availability zone within a new resource group. The source VM and all its resources remain untouched.
+A PowerShell script that creates a copy of an Azure VM in a target availability zone using VM restore points. The source VM and all its resources remain untouched.
 
 ## Overview
 
-This script safely copies an Azure VM (regional or zonal) to a specified availability zone in a **different** resource group. It performs a non-destructive operation—your source VM is stopped for consistent snapshots but never modified or deleted.
+This script safely copies an Azure VM (regional or zonal) to a specified availability zone. The target can be the same or a **different** resource group. It performs a non-destructive operation—your source VM is stopped for consistent restore points but never modified or deleted.
 
 ### What the Script Does
 
 1. **Validates** the source VM, target resource group, zone availability, and encryption status
-2. **Checks for Azure Disk Encryption (ADE)** and blocks if detected (ADE-encrypted disks cannot be copied)
-3. **Stops** the source VM for consistent snapshots
-4. **Creates incremental snapshots** of all disks (OS and data disks)
-5. **Creates new zonal disks** from the snapshots in the target resource group
-6. **Optionally converts disk SKUs** during migration (e.g., Premium to Standard)
-7. **Creates a new NIC** with all configurations copied from the source
-8. **Creates the new VM** in the target availability zone
-9. **Cleans up** temporary snapshots
-10. **Reports** any VM extensions that need manual installation
+2. **Checks VM restore point compatibility** and warns about unsupported disk types
+3. **Checks for Azure Disk Encryption (ADE)** and blocks if detected (ADE-encrypted disks cannot be copied)
+4. **Stops** the source VM for consistent restore points
+5. **Creates a VM restore point** with all disks (multi-disk consistent)
+6. **Creates new zonal disks** from the disk restore points in the target resource group
+7. **Optionally converts disk SKUs** during migration (e.g., Premium to Standard)
+8. **Creates a new NIC** with all configurations copied from the source
+9. **Creates the new VM** in the target availability zone
+10. **Cleans up** the temporary restore point collection
+11. **Reports** any VM extensions that need manual installation
 
 ## Requirements
 
@@ -43,7 +44,7 @@ Install-Module -Name Az.Compute, Az.Network, Az.Resources -Scope CurrentUser
 
 ```powershell
 .\move-vmtozone.ps1 -ResourceGroupName <source-rg> -VMName <vm-name> `
-    -TargetResourceGroupName <target-rg> -TargetZone <1|2|3> `
+    -TargetZone <1|2|3> [-TargetResourceGroupName <target-rg>] `
     [-NewVMName <new-vm-name>] [-TargetOsDiskSku <sku>] [-TargetDataDiskSku <sku>] [-WhatIf]
 ```
 
@@ -53,11 +54,12 @@ Install-Module -Name Az.Compute, Az.Network, Az.Resources -Scope CurrentUser
 |-----------|----------|-------------|
 | `ResourceGroupName` | Yes | The resource group name of the source VM |
 | `VMName` | Yes | The name of the source VM to copy |
-| `TargetResourceGroupName` | Yes | The resource group where new resources will be created (must be different from source) |
 | `TargetZone` | Yes | The target availability zone (1, 2, or 3) |
-| `NewVMName` | No | Name for the new VM (defaults to same name as source) |
+| `TargetResourceGroupName` | No | The resource group for new resources (defaults to source RG) |
+| `NewVMName` | Conditional | Name for the new VM. **Required** if target RG equals source RG |
 | `TargetOsDiskSku` | No | SKU for the new OS disk (defaults to source SKU) |
 | `TargetDataDiskSku` | No | SKU for all new data disks (defaults to each source disk's SKU) |
+| `ParallelDiskCreation` | No | Number of data disks to create in parallel (1-16, default: 1) |
 | `WhatIf` | No | Preview mode—shows what would happen without making changes |
 
 ### Valid Disk SKU Values
@@ -70,11 +72,18 @@ Install-Module -Name Az.Compute, Az.Network, Az.Resources -Scope CurrentUser
 - `PremiumV2_LRS` - Premium SSD v2 (requires `Caching='None'`)
 - `UltraSSD_LRS` - Ultra Disk (requires `Caching='None'`)
 
-> **Note:** When converting to `PremiumV2_LRS` or `UltraSSD_LRS`, the source disk must already have `Caching='None'` configured.
+> **Note:** When converting to `PremiumV2_LRS` or `UltraSSD_LRS`, the script automatically uses Azure defaults for IOPS and throughput (source values are not copied since they may not be valid for the new SKU). The new VM will have `Caching='None'` set for these disks.
 
 ### Examples
 
-**Copy a VM to zone 2 (same name, different resource group):**
+**Copy a VM to zone 2 in the same resource group:**
+
+```powershell
+.\move-vmtozone.ps1 -ResourceGroupName "my-rg" -VMName "my-vm" `
+    -TargetZone 2 -NewVMName "my-vm-zone2"
+```
+
+**Copy a VM to zone 2 in a different resource group (same name):**
 
 ```powershell
 .\move-vmtozone.ps1 -ResourceGroupName "my-source-rg" -VMName "my-vm" `
@@ -101,6 +110,13 @@ Install-Module -Name Az.Compute, Az.Network, Az.Resources -Scope CurrentUser
 .\move-vmtozone.ps1 -ResourceGroupName "my-source-rg" -VMName "my-vm" `
     -TargetResourceGroupName "my-target-rg" -TargetZone 2 `
     -TargetOsDiskSku StandardSSD_LRS -TargetDataDiskSku StandardSSD_LRS
+```
+
+**Copy a VM with many data disks using parallel creation:**
+
+```powershell
+.\move-vmtozone.ps1 -ResourceGroupName "my-rg" -VMName "my-vm-16disks" `
+    -TargetZone 2 -NewVMName "my-vm-zone2" -ParallelDiskCreation 8
 ```
 
 ### Prerequisites
@@ -137,6 +153,7 @@ The script preserves the following from the source VM:
 - **Identity:** System-assigned and user-assigned managed identities
 - **Spot VM settings:** Priority, eviction policy, max price
 - **Proximity Placement Group:** If compatible with target zone
+- **Resource cleanup:** NIC and all disks are configured with `DeleteOption=Delete` so they are automatically deleted when the VM is deleted
 
 ### Disk SKU Conversion
 
@@ -149,8 +166,26 @@ You can convert disk SKUs during migration:
 
 ### Special Disk Handling
 
-- **Ultra Disks & Premium SSD v2:** Uses instant access snapshots for faster disk creation
+- **VM Restore Points:** Uses crash-consistent restore points for multi-disk consistency
 - **Caching validation:** Ensures Premium V2 and Ultra disks have `None` caching (Azure requirement)
+- **SKU conversion:** When converting to Premium SSD v2 or Ultra SSD, IOPS/throughput values are not copied from source (Azure applies appropriate defaults for the new SKU)
+- **Parallel creation:** Use `-ParallelDiskCreation` to speed up migrations with many data disks
+
+### VM Restore Point Limitations
+
+The script uses VM restore points instead of individual snapshots. This provides better multi-disk consistency but has some limitations:
+
+| Disk Type | Crash Consistent | Application Consistent |
+|-----------|-----------------|----------------------|
+| Standard HDD/SSD | ✅ Supported | ✅ Supported |
+| Premium SSD | ✅ Supported | ✅ Supported |
+| Premium SSD v2 | ❌ Not supported | ⚠️ May work |
+| Ultra SSD | ❌ Not supported | ⚠️ May work |
+| Write-accelerated disks | ❌ Not supported | ⚠️ May work |
+| Ephemeral OS disks | ❌ Not supported | ❌ Not supported |
+| Shared disks | ❌ Not supported | ❌ Not supported |
+
+> **Note:** The script checks for these limitations before proceeding and will warn or stop if your VM uses unsupported disk types. For more details, see [VM restore points limitations](https://learn.microsoft.com/azure/virtual-machines/virtual-machines-create-restore-points#limitations).
 
 ### Security Validations
 
@@ -171,11 +206,13 @@ The script intelligently handles PPGs:
 | Limitation | Details |
 |------------|----------|
 | **Single NIC only** | VMs with multiple NICs are not supported |
-| **Different resource group required** | Target RG must be different from source RG |
 | **New IP address** | New VM will have a different IP than the source |
 | **No Public IP copy** | Public IPs are not copied (must be attached manually) |
 | **No VM extensions** | Extensions are not automatically installed on the new VM |
 | **No ADE support** | VMs with Azure Disk Encryption (BitLocker/dm-crypt) are blocked |
+| **No Ultra SSD/Premium v2** | Crash-consistent restore points don't support these disk types |
+| **No Ephemeral/Shared disks** | Ephemeral OS disks and shared disks are not supported |
+| **Same RG requires new name** | If target RG equals source RG, NewVMName must be different |
 
 ## IP Address Handling
 
@@ -212,8 +249,12 @@ The script provides detailed progress information and a final summary showing:
 **"No Azure context set"**
 - Run `Set-AzContext -SubscriptionId "your-subscription-id"` before the script
 
-**"Target resource group must be different from source"**
-- Create a new resource group for the target VM
+**"NewVMName must be different from source VMName"**
+- When using the same resource group, you must specify a different name via `-NewVMName`
+
+**"VM is not compatible with VM restore points"**
+- Your VM has disks that don't support restore points (Ultra SSD, Premium SSD v2, shared disks, etc.)
+- Consider using individual snapshots for these VMs or changing disk types
 
 **"VM size not available in zone"**
 - Choose a different target zone or resize the VM before migration
@@ -227,8 +268,8 @@ The script provides detailed progress information and a final summary showing:
 **"Caching must be 'None' for Premium V2 / Ultra disks"**
 - Change the source disk caching to `None` before running the script, or choose a different target SKU
 
-**"Snapshot timeout"**
-- For large disks, the script may take longer; it will retry automatically
+**"Restore point creation timeout"**
+- For large disks, the restore point may take longer; it will retry automatically
 
 ## License
 

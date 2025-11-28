@@ -1,18 +1,19 @@
 <#
 .SYNOPSIS
-    Creates a copy of an Azure VM in a target availability zone within a new resource group.
+    Creates a copy of an Azure VM in a target availability zone using VM restore points.
 
 .DESCRIPTION
     This script creates a zonal copy of an Azure VM (regional or zonal) into a specified
-    availability zone and a DIFFERENT target resource group. The source VM and all its 
-    resources remain untouched. The script:
-    - Creates snapshots of all disks (in target resource group)
-    - Creates new zonal disks from snapshots in the target resource group
+    availability zone. The target can be the same or a different resource group. 
+    The source VM and all its resources remain untouched. The script:
+    - Creates a VM restore point collection and restore point (multi-disk consistent)
+    - Creates new zonal disks from disk restore points in the target resource group
     - Creates a new NIC with all configurations copied from the source
     - Creates the new VM in the target resource group
 
     IMPORTANT: This script does NOT delete or modify any source resources.
-    The target resource group MUST be different from the source resource group.
+    If the target resource group is the same as the source (or not specified),
+    the new VM name (NewVMName) MUST be different from the source VM name.
     
     PREREQUISITE: Set your Azure context before running this script using:
     Set-AzContext -SubscriptionId "your-subscription-id"
@@ -24,15 +25,18 @@
     The name of the source VM to copy.
 
 .PARAMETER TargetResourceGroupName
-    The resource group where the new VM and all resources will be created.
-    This resource group must already exist and MUST be different from the source resource group.
+    Optional. The resource group where the new VM and all resources will be created.
+    If not specified, defaults to the source resource group.
+    If the target is the same as the source, NewVMName must be different from the source VM name.
 
 .PARAMETER TargetZone
     The target availability zone (1, 2, or 3).
 
 .PARAMETER NewVMName
-    Optional. The name for the new VM. Defaults to the same name as the source VM
-    (since it will be in a different resource group).
+    Optional. The name for the new VM. 
+    If target RG is different from source, defaults to the same name as the source VM.
+    If target RG is the same as source (or not specified), this parameter is REQUIRED
+    and must be different from the source VM name.
 
 .PARAMETER TargetOsDiskSku
     Optional. The SKU for the target OS disk. If not specified, uses the same SKU as the source.
@@ -46,8 +50,17 @@
     Note: PremiumV2_LRS and UltraSSD_LRS only support Caching='None'. If converting to these SKUs,
     all source data disks must already have Caching='None'.
 
+.PARAMETER ParallelDiskCreation
+    Optional. Number of data disks to create in parallel (1-16). Default is 1 (sequential).
+    Setting this to a higher value (e.g., 4-8) can significantly speed up migration for VMs with many data disks.
+    Each parallel disk creation uses a separate Azure API call.
+
 .PARAMETER WhatIf
     Optional. If specified, shows what would happen without making any changes.
+
+.EXAMPLE
+    .\move-vmtozone.ps1 -ResourceGroupName "my-rg" -VMName "my-vm" -TargetZone 2 -NewVMName "my-vm-zone2"
+    # Creates 'my-vm-zone2' in same RG 'my-rg' in zone 2
 
 .EXAMPLE
     .\move-vmtozone.ps1 -ResourceGroupName "my-source-rg" -VMName "my-vm" `
@@ -59,6 +72,11 @@
         -TargetResourceGroupName "my-target-rg" -TargetZone 1 -NewVMName "my-vm-new" -WhatIf
     # Creates 'my-vm-new' in 'my-target-rg' in zone 1 with WhatIf preview
 
+.EXAMPLE
+    .\move-vmtozone.ps1 -ResourceGroupName "my-rg" -VMName "my-vm-16disks" `
+        -TargetZone 2 -NewVMName "my-vm-zone2" -ParallelDiskCreation 8
+    # Creates VM copy with 8 data disks created in parallel for faster migration
+
 .NOTES
     Requires: PowerShell 7.0+, Az.Compute, Az.Network, Az.Resources modules
     
@@ -67,12 +85,20 @@
     - The source NIC keeps its IP (source resources are NOT modified)
     - You may need to update DNS records or firewall rules after migration
     
-    LIMITATIONS:
+    VM RESTORE POINTS LIMITATIONS:
+    - Ultra disks, Premium SSD v2 disks are NOT supported for crash consistency mode
+    - Write-accelerated disks are NOT supported for crash consistency mode
+    - Ephemeral OS disks and shared disks are NOT supported
+    - Maximum 500 restore points can be retained per VM
+    - Concurrent creation of restore points for a VM is not supported
+    - VMs in VMSS with Uniform orchestration are not supported
+    - Application-consistent restore points require VSS (Windows) or pre/post scripts (Linux)
+    
+    GENERAL LIMITATIONS:
     - VMs with multiple NICs are not supported
-    - The target resource group must already exist and be DIFFERENT from source
+    - If target RG equals source RG, NewVMName must be different from VMName
     - New VM will have a DIFFERENT IP address than the source
     - VM extensions are NOT automatically installed on the new VM
-    - All new resources (disks, NIC, VM) will have the same names as source (in different RG)
     - Proximity Placement Groups: New VM is only added to source PPG if the PPG is compatible
       with the target zone. PPGs with running regional VMs or VMs in different zones are skipped.
 #>
@@ -90,8 +116,7 @@ param(
     [ValidateNotNullOrEmpty()]
     [string]$VMName,
     
-    [Parameter(Mandatory = $true)]
-    [ValidateNotNullOrEmpty()]
+    [Parameter(Mandatory = $false)]
     [string]$TargetResourceGroupName,
     
     [Parameter(Mandatory = $true)]
@@ -107,7 +132,11 @@ param(
     
     [Parameter(Mandatory = $false)]
     [ValidateSet('Standard_LRS', 'StandardSSD_LRS', 'StandardSSD_ZRS', 'Premium_LRS', 'Premium_ZRS', 'PremiumV2_LRS', 'UltraSSD_LRS')]
-    [string]$TargetDataDiskSku
+    [string]$TargetDataDiskSku,
+    
+    [Parameter(Mandatory = $false)]
+    [ValidateRange(1, 16)]
+    [int]$ParallelDiskCreation = 1
 )
 
 Set-StrictMode -Version Latest
@@ -280,125 +309,279 @@ function Get-VMExtensionsList {
     return $extensions
 }
 
-function New-DiskSnapshot {
+function Test-VMRestorePointCompatibility {
     <#
     .SYNOPSIS
-        Creates an incremental snapshot of a disk.
-        For Ultra Disks and Premium SSD v2, uses instant access snapshots when available.
+        Checks if a VM is compatible with VM restore points and warns about limitations.
+    .DESCRIPTION
+        VM restore points have specific limitations. This function checks if the source VM
+        has any disks or configurations that are not supported and warns the user.
+    .OUTPUTS
+        Hashtable with: IsCompatible, Warnings, Errors
     #>
     param(
         [Parameter(Mandatory = $true)]
-        [string]$DiskName,
+        [Microsoft.Azure.Commands.Compute.Models.PSVirtualMachine]$VM,
         [Parameter(Mandatory = $true)]
-        [string]$DiskResourceGroupName,
-        [Parameter(Mandatory = $true)]
-        [string]$SnapshotResourceGroupName,
-        [Parameter(Mandatory = $true)]
-        [string]$Location,
+        [hashtable]$DiskInfo,
         [Parameter(Mandatory = $false)]
-        [int]$TimeoutMinutes = 30,
-        [Parameter(Mandatory = $false)]
-        [int]$InstantAccessDurationMinutes = 300
+        [string]$ConsistencyMode = 'CrashConsistent'  # or 'ApplicationConsistent'
     )
     
-    $disk = Get-AzDisk -ResourceGroupName $DiskResourceGroupName -DiskName $DiskName
-    $diskSku = $disk.Sku.Name
-    
-    # Generate snapshot name - Azure has 80 char limit for snapshot names
-    $timestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
-    $baseName = $DiskName
-    # Truncate base name if needed to fit within 80 chars (leaving room for -snap- and timestamp)
-    $maxBaseNameLength = 80 - "-snap-".Length - $timestamp.Length
-    if ($baseName.Length -gt $maxBaseNameLength) {
-        $baseName = $baseName.Substring(0, $maxBaseNameLength)
-    }
-    $snapshotName = "$baseName-snap-$timestamp"
-    
-    # Check if this is an Ultra Disk or Premium SSD v2 - they support instant access snapshots
-    $useInstantAccess = $diskSku -in @('UltraSSD_LRS', 'PremiumV2_LRS')
-    
-    if ($useInstantAccess) {
-        Write-Info "Disk '$DiskName' is $diskSku - using instant access snapshot for faster disk creation..."
-        $snapshotConfig = New-AzSnapshotConfig `
-            -SourceUri $disk.Id `
-            -Location $Location `
-            -CreateOption Copy `
-            -Incremental `
-            -InstantAccessDurationMinutes $InstantAccessDurationMinutes
-    }
-    else {
-        $snapshotConfig = New-AzSnapshotConfig `
-            -SourceUri $disk.Id `
-            -Location $Location `
-            -CreateOption Copy `
-            -Incremental
+    $result = @{
+        IsCompatible = $true
+        Warnings     = @()
+        Errors       = @()
     }
     
-    Write-Info "Creating incremental snapshot '$snapshotName' for disk '$DiskName'..."
-    $snapshot = New-AzSnapshot -ResourceGroupName $SnapshotResourceGroupName -SnapshotName $snapshotName -Snapshot $snapshotConfig
+    # Check all disks for compatibility issues
+    $allDisks = @($DiskInfo.OsDisk) + @($DiskInfo.DataDisks)
     
-    # Wait for snapshot to be ready
-    # For instant access snapshots (Ultra/PremiumV2), we can use them immediately when in InstantAccess or AvailableWithInstantAccess state
-    # For regular snapshots, we wait for SnapshotAccessState = 'Available'
+    foreach ($disk in $allDisks) {
+        $diskName = $disk.Name
+        $diskSku = $disk.Sku
+        
+        # Get the actual disk to check additional properties
+        $actualDisk = Get-AzDisk -ResourceGroupName $VM.ResourceGroupName -DiskName $diskName -ErrorAction SilentlyContinue
+        
+        if ($actualDisk) {
+            # Check for Ultra disks - NOT supported for crash consistency
+            if ($diskSku -eq 'UltraSSD_LRS') {
+                if ($ConsistencyMode -eq 'CrashConsistent') {
+                    $result.Errors += "Disk '$diskName' is an Ultra SSD. Ultra disks are NOT supported for crash-consistent restore points."
+                    $result.IsCompatible = $false
+                }
+                else {
+                    $result.Warnings += "Disk '$diskName' is an Ultra SSD. Ultra disks are NOT supported for crash-consistent mode but may work with application-consistent mode."
+                }
+            }
+            
+            # Check for Premium SSD v2 - NOT supported for crash consistency
+            if ($diskSku -eq 'PremiumV2_LRS') {
+                if ($ConsistencyMode -eq 'CrashConsistent') {
+                    $result.Errors += "Disk '$diskName' is a Premium SSD v2. Premium SSD v2 disks are NOT supported for crash-consistent restore points."
+                    $result.IsCompatible = $false
+                }
+                else {
+                    $result.Warnings += "Disk '$diskName' is a Premium SSD v2. Premium SSD v2 disks are NOT supported for crash-consistent mode but may work with application-consistent mode."
+                }
+            }
+            
+            # Check for Write Accelerator - NOT supported for crash consistency
+            # Note: Write Accelerator is set on the VM config, not the disk itself
+            
+            # Check for shared disks - NOT supported
+            if ($actualDisk.MaxShares -and $actualDisk.MaxShares -gt 1) {
+                $result.Errors += "Disk '$diskName' is a shared disk (MaxShares=$($actualDisk.MaxShares)). Shared disks are NOT supported for restore points."
+                $result.IsCompatible = $false
+            }
+            
+            # Check for Ephemeral OS disk - NOT supported
+            if ($actualDisk.DiskState -eq 'Reserved' -and $disk.Name -eq $DiskInfo.OsDisk.Name) {
+                # Check if it's an ephemeral disk by looking at the VM config
+                if ($VM.StorageProfile.OsDisk.DiffDiskSettings) {
+                    $result.Errors += "The OS disk is an Ephemeral disk. Ephemeral OS disks are NOT supported for restore points."
+                    $result.IsCompatible = $false
+                }
+            }
+        }
+    }
+    
+    # Check for Write Accelerator on VM disks
+    if ($VM.StorageProfile.OsDisk.WriteAcceleratorEnabled -eq $true) {
+        if ($ConsistencyMode -eq 'CrashConsistent') {
+            $result.Errors += "OS disk has Write Accelerator enabled. Write-accelerated disks are NOT supported for crash-consistent restore points."
+            $result.IsCompatible = $false
+        }
+    }
+    
+    foreach ($dataDisk in $VM.StorageProfile.DataDisks) {
+        if ($dataDisk.WriteAcceleratorEnabled -eq $true) {
+            if ($ConsistencyMode -eq 'CrashConsistent') {
+                $result.Errors += "Data disk '$($dataDisk.Name)' has Write Accelerator enabled. Write-accelerated disks are NOT supported for crash-consistent restore points."
+                $result.IsCompatible = $false
+            }
+        }
+    }
+    
+    # Check for Ephemeral OS disk via DiffDiskSettings
+    if ($VM.StorageProfile.OsDisk.DiffDiskSettings) {
+        $result.Errors += "The VM uses an Ephemeral OS disk. Ephemeral OS disks are NOT supported for restore points."
+        $result.IsCompatible = $false
+    }
+    
+    # Check for VMSS with Uniform orchestration (not applicable for standalone VMs, but document it)
+    if ($VM.VirtualMachineScaleSet) {
+        $result.Warnings += "This VM is part of a Virtual Machine Scale Set. Restore points for VMs in VMSS with Uniform orchestration are not supported."
+    }
+    
+    return $result
+}
+
+function New-VMRestorePointCollection {
+    <#
+    .SYNOPSIS
+        Creates a VM restore point collection for a source VM.
+    #>
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$SourceVMId,
+        [Parameter(Mandatory = $true)]
+        [string]$ResourceGroupName,
+        [Parameter(Mandatory = $true)]
+        [string]$CollectionName,
+        [Parameter(Mandatory = $true)]
+        [string]$Location
+    )
+    
+    Write-Info "Creating restore point collection '$CollectionName'..."
+    
+    # Check if collection already exists
+    $existingCollection = Get-AzRestorePointCollection -ResourceGroupName $ResourceGroupName -Name $CollectionName -ErrorAction SilentlyContinue
+    if ($existingCollection) {
+        Write-Warning "Restore point collection '$CollectionName' already exists. Using existing collection."
+        return $existingCollection
+    }
+    
+    $collection = New-AzRestorePointCollection `
+        -ResourceGroupName $ResourceGroupName `
+        -Name $CollectionName `
+        -Location $Location `
+        -VmId $SourceVMId
+    
+    Write-Success "Restore point collection '$CollectionName' created successfully."
+    return $collection
+}
+
+function New-VMRestorePoint {
+    <#
+    .SYNOPSIS
+        Creates a VM restore point within a restore point collection.
+    #>
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ResourceGroupName,
+        [Parameter(Mandatory = $true)]
+        [string]$CollectionName,
+        [Parameter(Mandatory = $true)]
+        [string]$RestorePointName,
+        [Parameter(Mandatory = $false)]
+        [string]$ConsistencyMode = 'CrashConsistent',  # or 'ApplicationConsistent'
+        [Parameter(Mandatory = $false)]
+        [int]$TimeoutMinutes = 30
+    )
+    
+    Write-Info "Creating restore point '$RestorePointName' (mode: $ConsistencyMode)..."
+    
+    # Create the restore point
+    $restorePoint = New-AzRestorePoint `
+        -ResourceGroupName $ResourceGroupName `
+        -RestorePointCollectionName $CollectionName `
+        -Name $RestorePointName `
+        -ConsistencyMode $ConsistencyMode
+    
+    # Wait for restore point to be ready
     $startTime = Get-Date
     $timeout = New-TimeSpan -Minutes $TimeoutMinutes
     $retryDelay = 5
     $maxRetryDelay = 30
     
     while ($true) {
-        $currentSnapshot = Get-AzSnapshot -ResourceGroupName $SnapshotResourceGroupName -SnapshotName $snapshotName
+        $currentRP = Get-AzRestorePoint `
+            -ResourceGroupName $ResourceGroupName `
+            -RestorePointCollectionName $CollectionName `
+            -Name $RestorePointName
         
-        if ($currentSnapshot.ProvisioningState -eq 'Failed') {
-            throw "Snapshot '$snapshotName' failed. State: $($currentSnapshot.ProvisioningState)"
+        if ($currentRP.ProvisioningState -eq 'Failed') {
+            throw "Restore point '$RestorePointName' failed. State: $($currentRP.ProvisioningState)"
         }
         
         if ((Get-Date) - $startTime -gt $timeout) {
-            throw "Timeout waiting for snapshot '$snapshotName' to complete. Current state: $($currentSnapshot.ProvisioningState), AccessState: $($currentSnapshot.SnapshotAccessState)"
+            throw "Timeout waiting for restore point '$RestorePointName' to complete. Current state: $($currentRP.ProvisioningState)"
         }
         
-        $provisioningComplete = $currentSnapshot.ProvisioningState -eq 'Succeeded'
-        $accessState = $currentSnapshot.SnapshotAccessState
-        
-        # For instant access snapshots, we can proceed immediately when in InstantAccess or AvailableWithInstantAccess state
-        # For regular snapshots, we need to wait for Available state
-        if ($useInstantAccess) {
-            $snapshotReady = $accessState -in @('InstantAccess', 'AvailableWithInstantAccess', 'Available')
-        }
-        else {
-            $snapshotReady = ($null -eq $accessState) -or ($accessState -eq 'Available')
-        }
-        
-        if ($provisioningComplete -and $snapshotReady) {
-            if ($useInstantAccess -and $accessState -in @('InstantAccess', 'AvailableWithInstantAccess')) {
-                Write-Success "Instant access snapshot '$snapshotName' ready (AccessState: $accessState)."
-            }
-            else {
-                Write-Success "Snapshot '$snapshotName' completed successfully."
-            }
+        if ($currentRP.ProvisioningState -eq 'Succeeded') {
+            Write-Success "Restore point '$RestorePointName' created successfully."
             break
         }
         
-        $statusMsg = "Provisioning: $($currentSnapshot.ProvisioningState)"
-        if ($null -ne $accessState) {
-            $statusMsg += ", AccessState: $accessState"
-        }
-        Write-Detail "Waiting for snapshot... ($statusMsg)"
-        
+        Write-Detail "Waiting for restore point... (State: $($currentRP.ProvisioningState))"
         Start-Sleep -Seconds $retryDelay
         $retryDelay = [Math]::Min($retryDelay * 1.5, $maxRetryDelay)
     }
     
-    return $snapshot
+    return $currentRP
 }
 
-function New-ZonalDiskFromSnapshot {
+function Get-DiskRestorePointIds {
     <#
     .SYNOPSIS
-        Creates a new zonal managed disk from a snapshot in the target resource group.
+        Gets the disk restore point IDs from a VM restore point.
+    .DESCRIPTION
+        Returns a hashtable mapping disk names to their disk restore point IDs.
     #>
     param(
         [Parameter(Mandatory = $true)]
-        [string]$SnapshotId,
+        [string]$ResourceGroupName,
+        [Parameter(Mandatory = $true)]
+        [string]$CollectionName,
+        [Parameter(Mandatory = $true)]
+        [string]$RestorePointName,
+        [Parameter(Mandatory = $true)]
+        [Microsoft.Azure.Commands.Compute.Models.PSVirtualMachine]$SourceVM
+    )
+    
+    Write-Info "Retrieving disk restore point IDs..."
+    
+    # Get the restore point with instance view to get disk restore points
+    $restorePoint = Get-AzRestorePoint `
+        -ResourceGroupName $ResourceGroupName `
+        -RestorePointCollectionName $CollectionName `
+        -Name $RestorePointName `
+        -InstanceView
+    
+    $diskRestorePoints = @{}
+    
+    # The restore point contains SourceMetadata.StorageProfile with disk info
+    # And the disk restore points in the SourceRestorePoint.DiskRestorePoints collection
+    
+    if ($restorePoint.SourceMetadata -and $restorePoint.SourceMetadata.StorageProfile) {
+        $storageProfile = $restorePoint.SourceMetadata.StorageProfile
+        
+        # Map OS disk
+        if ($storageProfile.OsDisk -and $storageProfile.OsDisk.DiskRestorePoint) {
+            $osDiskName = $SourceVM.StorageProfile.OsDisk.Name
+            $diskRestorePoints[$osDiskName] = $storageProfile.OsDisk.DiskRestorePoint.Id
+            Write-Detail "  OS Disk: $osDiskName"
+        }
+        
+        # Map data disks
+        if ($storageProfile.DataDisks) {
+            foreach ($dataDisk in $storageProfile.DataDisks) {
+                if ($dataDisk.DiskRestorePoint) {
+                    # Find matching source disk by LUN
+                    $sourceDisk = $SourceVM.StorageProfile.DataDisks | Where-Object { $_.Lun -eq $dataDisk.Lun }
+                    if ($sourceDisk) {
+                        $diskRestorePoints[$sourceDisk.Name] = $dataDisk.DiskRestorePoint.Id
+                        Write-Detail "  Data Disk (LUN $($dataDisk.Lun)): $($sourceDisk.Name)"
+                    }
+                }
+            }
+        }
+    }
+    
+    Write-Success "Retrieved $($diskRestorePoints.Count) disk restore point ID(s)."
+    return $diskRestorePoints
+}
+
+function New-ZonalDiskFromRestorePoint {
+    <#
+    .SYNOPSIS
+        Creates a new zonal managed disk from a disk restore point in the target resource group.
+    #>
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$DiskRestorePointId,
         [Parameter(Mandatory = $true)]
         [string]$NewDiskName,
         [Parameter(Mandatory = $true)]
@@ -433,8 +616,8 @@ function New-ZonalDiskFromSnapshot {
             -Location $Location `
             -Zone $Zone `
             -SkuName $SkuName `
-            -CreateOption Copy `
-            -SourceResourceId $SnapshotId `
+            -CreateOption Restore `
+            -SourceResourceId $DiskRestorePointId `
             -DiskEncryptionSetId $DiskEncryptionSetId
     }
     else {
@@ -442,8 +625,8 @@ function New-ZonalDiskFromSnapshot {
             -Location $Location `
             -Zone $Zone `
             -SkuName $SkuName `
-            -CreateOption Copy `
-            -SourceResourceId $SnapshotId
+            -CreateOption Restore `
+            -SourceResourceId $DiskRestorePointId
     }
     
     if ($DiskSizeGB -and $DiskSizeGB -gt 0) {
@@ -484,7 +667,7 @@ function New-ZonalDiskFromSnapshot {
     
     while ($retryCount -lt $MaxRetries) {
         try {
-            Write-Info "Creating zonal disk '$NewDiskName' in zone $Zone (attempt $($retryCount + 1)/$MaxRetries)..."
+            Write-Info "Creating zonal disk '$NewDiskName' in zone $Zone from restore point (attempt $($retryCount + 1)/$MaxRetries)..."
             $newDisk = New-AzDisk -ResourceGroupName $TargetResourceGroupName -DiskName $NewDiskName -Disk $diskConfig
             Write-Success "Zonal disk '$NewDiskName' created successfully."
             return $newDisk
@@ -596,31 +779,46 @@ function Test-DiskSkuAvailability {
 function Get-ZonalDiskParams {
     <#
     .SYNOPSIS
-        Builds parameter hashtable for New-ZonalDiskFromSnapshot, adding optional params only if present.
+        Builds parameter hashtable for New-ZonalDiskFromRestorePoint, adding optional params only if present.
     #>
     param(
-        [Parameter(Mandatory)] [string]$SnapshotId,
+        [Parameter(Mandatory)] [string]$DiskRestorePointId,
         [Parameter(Mandatory)] [string]$NewDiskName,
         [Parameter(Mandatory)] [string]$TargetResourceGroupName,
         [Parameter(Mandatory)] [string]$Location,
         [Parameter(Mandatory)] [int]$Zone,
         [Parameter(Mandatory)] [string]$SkuName,
+        [string]$SourceSkuName,
         [hashtable]$DiskInfo,
-        [hashtable]$Tags
+        [hashtable]$Tags,
+        [int]$MaxRetries = 3
     )
     
     $params = @{
-        SnapshotId              = $SnapshotId
+        DiskRestorePointId      = $DiskRestorePointId
         NewDiskName             = $NewDiskName
         TargetResourceGroupName = $TargetResourceGroupName
         Location                = $Location
         Zone                    = $Zone
         SkuName                 = $SkuName
+        MaxRetries              = $MaxRetries
     }
     
+    # Check if we're converting to PremiumV2 or Ultra from a different SKU
+    $isConvertingToAdvancedSku = ($SkuName -in @('PremiumV2_LRS', 'UltraSSD_LRS')) -and ($SourceSkuName -notin @('PremiumV2_LRS', 'UltraSSD_LRS'))
+    
     # Add optional disk properties if present
+    # Skip IOPS/throughput when converting TO PremiumV2/Ultra (they have different minimums/defaults)
+    $propsToSkipOnConversion = @('DiskIOPSReadWrite', 'DiskMBpsReadWrite', 'Tier')
+    
     @('DiskSizeGB', 'DiskIOPSReadWrite', 'DiskMBpsReadWrite', 'Tier', 'LogicalSectorSize', 'DiskEncryptionSetId') | ForEach-Object {
-        if ($DiskInfo.$_) { $params.$_ = $DiskInfo.$_ }
+        if ($DiskInfo.$_) {
+            # Skip IOPS/throughput/tier when converting to advanced SKUs - let Azure use defaults
+            if ($isConvertingToAdvancedSku -and $_ -in $propsToSkipOnConversion) {
+                return  # Skip this property
+            }
+            $params.$_ = $DiskInfo.$_
+        }
     }
     
     if ($Tags) { $params.Tags = $Tags }
@@ -756,10 +954,14 @@ Write-Detail "VM Size: $($vmConfig.HardwareProfile.VmSize)"
 Write-Detail "Current Zone: $(($vmConfig.Zones -and $vmConfig.Zones.Count -gt 0) ? $vmConfig.Zones[0] : 'None (Regional)')"
 Write-Detail "NICs: $($vmConfig.NetworkProfile.NetworkInterfaces.Count)"
 
-# Validate target resource group is different from source
-if ($TargetResourceGroupName -eq $ResourceGroupName) {
-    throw "Target resource group must be different from source resource group. Source: '$ResourceGroupName', Target: '$TargetResourceGroupName'"
+# Set default target resource group if not specified
+if (-not $TargetResourceGroupName) {
+    $TargetResourceGroupName = $ResourceGroupName
+    Write-Info "Target resource group not specified. Using source resource group: '$TargetResourceGroupName'"
 }
+
+# Check if target and source resource groups are the same
+$sameResourceGroup = ($TargetResourceGroupName -eq $ResourceGroupName)
 
 # Validate target resource group exists
 $targetRg = Get-AzResourceGroup -Name $TargetResourceGroupName -ErrorAction SilentlyContinue
@@ -768,9 +970,23 @@ if (-not $targetRg) {
 }
 Write-Success "Target resource group '$TargetResourceGroupName' exists."
 
-# Set default new VM name if not provided (defaults to same name since different RG)
-if (-not $NewVMName) {
-    $NewVMName = $VMName
+# Handle VM naming based on whether we're in the same or different resource group
+if ($sameResourceGroup) {
+    # Same resource group - NewVMName is REQUIRED and must be different
+    if (-not $NewVMName) {
+        throw "When target resource group is the same as source, you must specify a different NewVMName. Source VM: '$VMName'"
+    }
+    if ($NewVMName -eq $VMName) {
+        throw "NewVMName ('$NewVMName') must be different from source VMName ('$VMName') when using the same resource group."
+    }
+    Write-Info "Same resource group scenario: new VM will be named '$NewVMName'"
+}
+else {
+    # Different resource group - NewVMName defaults to VMName if not specified
+    if (-not $NewVMName) {
+        $NewVMName = $VMName
+    }
+    Write-Info "Different resource group scenario: new VM will be named '$NewVMName' in '$TargetResourceGroupName'"
 }
 Write-Detail "New VM Name: $NewVMName"
 
@@ -825,6 +1041,40 @@ Write-Info "Gathering disk information..."
 $diskInfo = Get-VMDiskInfo -VM $vmConfig
 Write-Success "Found OS disk and $($diskInfo.DataDisks.Count) data disk(s)."
 
+# Check VM restore point compatibility
+Write-Info "Checking VM restore point compatibility..."
+$rpCompatibility = Test-VMRestorePointCompatibility -VM $vmConfig -DiskInfo $diskInfo -ConsistencyMode 'CrashConsistent'
+
+if ($rpCompatibility.Warnings.Count -gt 0) {
+    Write-Host ""
+    Write-Host "╔══════════════════════════════════════════════════════════════════════════════╗" -ForegroundColor Yellow
+    Write-Host "║                    VM RESTORE POINT WARNINGS                                 ║" -ForegroundColor Yellow
+    Write-Host "╚══════════════════════════════════════════════════════════════════════════════╝" -ForegroundColor Yellow
+    Write-Host ""
+    foreach ($warning in $rpCompatibility.Warnings) {
+        Write-Host "  [!] $warning" -ForegroundColor Yellow
+    }
+    Write-Host ""
+}
+
+if (-not $rpCompatibility.IsCompatible) {
+    Write-Host ""
+    Write-Host "╔══════════════════════════════════════════════════════════════════════════════╗" -ForegroundColor Red
+    Write-Host "║              VM RESTORE POINT COMPATIBILITY ERRORS                           ║" -ForegroundColor Red
+    Write-Host "╚══════════════════════════════════════════════════════════════════════════════╝" -ForegroundColor Red
+    Write-Host ""
+    foreach ($err in $rpCompatibility.Errors) {
+        Write-Host "  [X] $err" -ForegroundColor Red
+    }
+    Write-Host ""
+    Write-Host "  VM restore points cannot be used for this VM due to the above limitations." -ForegroundColor White
+    Write-Host "  See: https://learn.microsoft.com/azure/virtual-machines/virtual-machines-create-restore-points#limitations" -ForegroundColor Gray
+    Write-Host ""
+    throw "Cannot proceed: VM '$VMName' is not compatible with VM restore points."
+}
+
+Write-Success "VM is compatible with restore points."
+
 Write-Info "Gathering NIC configuration..."
 $nicConfig = Get-VMNicConfig -VM $vmConfig
 Write-Success "NIC configuration gathered."
@@ -857,20 +1107,24 @@ if ($TargetDataDiskSku) {
 
 $osDiskCaching = $diskInfo.OsDisk.Caching
 
-# Validate OS disk caching - check against TARGET SKU (or source if not converting)
-if ($effectiveOsDiskSku -in @('PremiumV2_LRS', 'UltraSSD_LRS')) {
+# Validate OS disk caching - only check if SOURCE disk is already Ultra/PremiumV2 and keeping that SKU
+# (If converting TO Ultra/PremiumV2, we'll set caching to None on the new VM regardless of source)
+$sourceOsSku = $diskInfo.OsDisk.Sku
+if ($sourceOsSku -in @('PremiumV2_LRS', 'UltraSSD_LRS') -and -not $TargetOsDiskSku) {
     if ($osDiskCaching -ne 'None') {
-        throw "OS Disk '$($diskInfo.OsDisk.Name)' will use $effectiveOsDiskSku which only supports Caching='None'. Current caching is '$osDiskCaching'. Please change the caching setting on the source disk before running this script."
+        throw "OS Disk '$($diskInfo.OsDisk.Name)' is $sourceOsSku which only supports Caching='None'. Current caching is '$osDiskCaching'. Please change the caching setting on the source disk before running this script."
     }
-    Write-Success "OS Disk caching validated for $effectiveOsDiskSku."
+    Write-Success "OS Disk caching validated for $sourceOsSku."
 }
 
-# Validate data disk caching - check against TARGET SKU for each disk
+# Validate data disk caching - only check if SOURCE disk is already Ultra/PremiumV2 and keeping that SKU
+# (If converting TO Ultra/PremiumV2, we'll set caching to None on the new VM regardless of source)
 foreach ($dataDisk in $diskInfo.DataDisks) {
-    $targetDataSku = $effectiveDataDiskSku ?? $dataDisk.Sku
-    if ($targetDataSku -in @('PremiumV2_LRS', 'UltraSSD_LRS')) {
+    $sourceSku = $dataDisk.Sku
+    # Only validate if source is Ultra/PremiumV2 AND we're NOT converting to a different SKU
+    if ($sourceSku -in @('PremiumV2_LRS', 'UltraSSD_LRS') -and -not $TargetDataDiskSku) {
         if ($dataDisk.Caching -ne 'None') {
-            throw "Data Disk '$($dataDisk.Name)' will use $targetDataSku which only supports Caching='None'. Current caching is '$($dataDisk.Caching)'. Please change the caching setting on the source disk before running this script."
+            throw "Data Disk '$($dataDisk.Name)' is $sourceSku which only supports Caching='None'. Current caching is '$($dataDisk.Caching)'. Please change the caching setting on the source disk before running this script."
         }
     }
 }
@@ -1210,53 +1464,61 @@ else {
 
 #endregion
 
-#region Step 8: Create Disk Snapshots
-Write-StepHeader "8" "Create Disk Snapshots"
+#region Step 8: Create VM Restore Point
+Write-StepHeader "8" "Create VM Restore Point"
 
-$snapshots = @{
-    OsDisk    = $null
-    DataDisks = @()
+# Generate unique names for restore point collection and restore point
+$timestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+$rpCollectionName = "$VMName-rpc-$timestamp"
+$rpName = "$VMName-rp-$timestamp"
+
+# Truncate names if needed (Azure has 80 char limit)
+if ($rpCollectionName.Length -gt 80) {
+    $rpCollectionName = $rpCollectionName.Substring(0, 80)
+}
+if ($rpName.Length -gt 80) {
+    $rpName = $rpName.Substring(0, 80)
 }
 
-if ($PSCmdlet.ShouldProcess($diskInfo.OsDisk.Name, "Create snapshot")) {
-    # OS Disk snapshot
-    $osDiskSnapshot = New-DiskSnapshot `
-        -DiskName $diskInfo.OsDisk.Name `
-        -DiskResourceGroupName $ResourceGroupName `
-        -SnapshotResourceGroupName $TargetResourceGroupName `
+$restorePointData = @{
+    CollectionName = $rpCollectionName
+    RestorePointName = $rpName
+    DiskRestorePoints = @{}
+}
+
+if ($PSCmdlet.ShouldProcess($VMName, "Create VM restore point")) {
+    # Create restore point collection in source resource group (must be same RG as VM)
+    $rpCollection = New-VMRestorePointCollection `
+        -SourceVMId $vmConfig.Id `
+        -ResourceGroupName $ResourceGroupName `
+        -CollectionName $rpCollectionName `
         -Location $vmConfig.Location
     
-    $snapshots.OsDisk = $osDiskSnapshot
+    # Create restore point (crash-consistent)
+    $restorePoint = New-VMRestorePoint `
+        -ResourceGroupName $ResourceGroupName `
+        -CollectionName $rpCollectionName `
+        -RestorePointName $rpName `
+        -ConsistencyMode 'CrashConsistent'
+    
+    # Get disk restore point IDs
+    $restorePointData.DiskRestorePoints = Get-DiskRestorePointIds `
+        -ResourceGroupName $ResourceGroupName `
+        -CollectionName $rpCollectionName `
+        -RestorePointName $rpName `
+        -SourceVM $vmConfig
 }
 else {
-    Write-Info "[WhatIf] Would create snapshot for OS disk '$($diskInfo.OsDisk.Name)'."
+    Write-Info "[WhatIf] Would create restore point collection '$rpCollectionName'."
+    Write-Info "[WhatIf] Would create restore point '$rpName'."
 }
 
-# Data Disk snapshots
-foreach ($dataDisk in $diskInfo.DataDisks) {
-    if ($PSCmdlet.ShouldProcess($dataDisk.Name, "Create snapshot")) {
-        $dataDiskSnapshot = New-DiskSnapshot `
-            -DiskName $dataDisk.Name `
-            -DiskResourceGroupName $ResourceGroupName `
-            -SnapshotResourceGroupName $TargetResourceGroupName `
-            -Location $vmConfig.Location
-        
-        $snapshots.DataDisks += @{
-            Snapshot       = $dataDiskSnapshot
-            OriginalConfig = $dataDisk
-        }
-    }
-    else {
-        Write-Info "[WhatIf] Would create snapshot for data disk '$($dataDisk.Name)'."
-    }
-}
-
-Write-Success "All snapshots created."
+Write-Success "VM restore point created."
 
 #endregion
 
-#region Step 9: Create Zonal Disks from Snapshots
-Write-StepHeader "9" "Create Zonal Disks from Snapshots"
+#region Step 9: Create Zonal Disks from Restore Points
+Write-StepHeader "9" "Create Zonal Disks from Restore Points"
 
 $newDisks = @{
     OsDisk    = $null
@@ -1264,56 +1526,205 @@ $newDisks = @{
 }
 
 if ($PSCmdlet.ShouldProcess("OS Disk", "Create zonal disk in zone $TargetZone")) {
-    $newOsDiskName = Get-TargetDiskName -OriginalName $diskInfo.OsDisk.Name
+    # Determine new disk name - use suffix if same RG to avoid conflict
+    $newOsDiskName = if ($sameResourceGroup) {
+        Get-TargetDiskName -OriginalName "$($diskInfo.OsDisk.Name)-z$TargetZone"
+    } else {
+        Get-TargetDiskName -OriginalName $diskInfo.OsDisk.Name
+    }
     
     # Use target SKU if specified, otherwise keep source SKU
     $osDiskTargetSku = $TargetOsDiskSku ? $TargetOsDiskSku : $diskInfo.OsDisk.Sku
     
+    # Get disk restore point ID for OS disk
+    $osDiskRpId = $restorePointData.DiskRestorePoints[$diskInfo.OsDisk.Name]
+    if (-not $osDiskRpId) {
+        throw "Could not find disk restore point for OS disk '$($diskInfo.OsDisk.Name)'"
+    }
+    
     $osDiskParams = Get-ZonalDiskParams `
-        -SnapshotId $snapshots.OsDisk.Id `
+        -DiskRestorePointId $osDiskRpId `
         -NewDiskName $newOsDiskName `
         -TargetResourceGroupName $TargetResourceGroupName `
         -Location $vmConfig.Location `
         -Zone $TargetZone `
         -SkuName $osDiskTargetSku `
+        -SourceSkuName $diskInfo.OsDisk.Sku `
         -DiskInfo $diskInfo.OsDisk `
         -Tags $vmConfig.Tags
     
-    $newDisks.OsDisk = New-ZonalDiskFromSnapshot @osDiskParams
+    $newDisks.OsDisk = New-ZonalDiskFromRestorePoint @osDiskParams
 }
 else {
     Write-Info "[WhatIf] Would create zonal OS disk in zone $TargetZone."
 }
 
-# Create data disks
-foreach ($dataDiskInfo in $snapshots.DataDisks) {
-    $dataDisk = $dataDiskInfo.OriginalConfig
-    
-    if ($PSCmdlet.ShouldProcess($dataDisk.Name, "Create zonal disk in zone $TargetZone")) {
-        $newDataDiskName = Get-TargetDiskName -OriginalName $dataDisk.Name
+# Create data disks (with optional parallelism)
+if ($diskInfo.DataDisks.Count -gt 0) {
+    if ($PSCmdlet.ShouldProcess("$($diskInfo.DataDisks.Count) data disks", "Create zonal disks in zone $TargetZone")) {
         
-        # Use target SKU if specified, otherwise keep source SKU
-        $dataDiskTargetSku = $TargetDataDiskSku ? $TargetDataDiskSku : $dataDisk.Sku
+        # Prepare disk creation parameters for all data disks
+        $dataDiskJobs = @()
+        foreach ($dataDisk in $diskInfo.DataDisks) {
+            # Determine new disk name - use suffix if same RG to avoid conflict
+            $newDataDiskName = if ($sameResourceGroup) {
+                Get-TargetDiskName -OriginalName "$($dataDisk.Name)-z$TargetZone"
+            } else {
+                Get-TargetDiskName -OriginalName $dataDisk.Name
+            }
+            
+            # Use target SKU if specified, otherwise keep source SKU
+            $dataDiskTargetSku = $TargetDataDiskSku ? $TargetDataDiskSku : $dataDisk.Sku
+            
+            # Get disk restore point ID for this data disk
+            $dataDiskRpId = $restorePointData.DiskRestorePoints[$dataDisk.Name]
+            if (-not $dataDiskRpId) {
+                throw "Could not find disk restore point for data disk '$($dataDisk.Name)'"
+            }
+            
+            $dataDiskJobs += @{
+                OriginalName = $dataDisk.Name
+                NewDiskName  = $newDataDiskName
+                Lun          = $dataDisk.Lun
+                Caching      = $dataDisk.Caching
+                Params       = Get-ZonalDiskParams `
+                    -DiskRestorePointId $dataDiskRpId `
+                    -NewDiskName $newDataDiskName `
+                    -TargetResourceGroupName $TargetResourceGroupName `
+                    -Location $vmConfig.Location `
+                    -Zone $TargetZone `
+                    -SkuName $dataDiskTargetSku `
+                    -SourceSkuName $dataDisk.Sku `
+                    -DiskInfo $dataDisk `
+                    -Tags $vmConfig.Tags
+            }
+        }
         
-        $dataDiskParams = Get-ZonalDiskParams `
-            -SnapshotId $dataDiskInfo.Snapshot.Id `
-            -NewDiskName $newDataDiskName `
-            -TargetResourceGroupName $TargetResourceGroupName `
-            -Location $vmConfig.Location `
-            -Zone $TargetZone `
-            -SkuName $dataDiskTargetSku `
-            -DiskInfo $dataDisk `
-            -Tags $vmConfig.Tags
-        
-        $newDataDisk = New-ZonalDiskFromSnapshot @dataDiskParams
-        $newDisks.DataDisks += @{
-            Disk       = $newDataDisk
-            Lun        = $dataDisk.Lun
-            Caching    = $dataDisk.Caching
+        if ($ParallelDiskCreation -gt 1 -and $dataDiskJobs.Count -gt 1) {
+            # Parallel disk creation
+            Write-Info "Creating $($dataDiskJobs.Count) data disks in parallel (throttle: $ParallelDiskCreation)..."
+            
+            $createdDisks = $dataDiskJobs | ForEach-Object -ThrottleLimit $ParallelDiskCreation -Parallel {
+                # Import required module in the parallel runspace
+                Import-Module Az.Compute -ErrorAction SilentlyContinue
+                
+                $job = $_
+                $params = $job.Params
+                
+                # Build disk config
+                $diskConfigParams = @{
+                    Location        = $params.Location
+                    Zone            = $params.Zone
+                    SkuName         = $params.SkuName
+                    CreateOption    = 'Restore'
+                    SourceResourceId = $params.DiskRestorePointId
+                }
+                if ($params.DiskEncryptionSetId) {
+                    $diskConfigParams.DiskEncryptionSetId = $params.DiskEncryptionSetId
+                }
+                
+                $diskConfig = New-AzDiskConfig @diskConfigParams
+                
+                if ($params.DiskSizeGB -and $params.DiskSizeGB -gt 0) {
+                    $diskConfig.DiskSizeGB = $params.DiskSizeGB
+                }
+                if ($params.DiskIOPSReadWrite -and $params.DiskIOPSReadWrite -gt 0) {
+                    $diskConfig.DiskIOPSReadWrite = $params.DiskIOPSReadWrite
+                }
+                if ($params.DiskMBpsReadWrite -and $params.DiskMBpsReadWrite -gt 0) {
+                    $diskConfig.DiskMBpsReadWrite = $params.DiskMBpsReadWrite
+                }
+                if ($params.Tier) {
+                    $diskConfig.Tier = $params.Tier
+                }
+                if ($params.LogicalSectorSize -and $params.LogicalSectorSize -gt 0) {
+                    $diskConfig.CreationData.LogicalSectorSize = $params.LogicalSectorSize
+                }
+                if ($params.Tags -and $params.Tags.Count -gt 0) {
+                    foreach ($key in $params.Tags.Keys) {
+                        $diskConfig.Tags[$key] = $params.Tags[$key]
+                    }
+                }
+                
+                # Check if disk already exists
+                $existingDisk = Get-AzDisk -ResourceGroupName $params.TargetResourceGroupName -DiskName $params.NewDiskName -ErrorAction SilentlyContinue
+                if ($existingDisk) {
+                    return @{
+                        OriginalName = $job.OriginalName
+                        NewDiskName  = $job.NewDiskName
+                        Lun          = $job.Lun
+                        Caching      = $job.Caching
+                        Disk         = $existingDisk
+                        Status       = 'Existing'
+                    }
+                }
+                
+                # Create disk with retry
+                $maxRetries = $params.MaxRetries
+                $retryCount = 0
+                $lastError = $null
+                
+                while ($retryCount -lt $maxRetries) {
+                    try {
+                        $newDisk = New-AzDisk -ResourceGroupName $params.TargetResourceGroupName -DiskName $params.NewDiskName -Disk $diskConfig
+                        return @{
+                            OriginalName = $job.OriginalName
+                            NewDiskName  = $job.NewDiskName
+                            Lun          = $job.Lun
+                            Caching      = $job.Caching
+                            Disk         = $newDisk
+                            Status       = 'Created'
+                        }
+                    }
+                    catch {
+                        $lastError = $_
+                        $retryCount++
+                        if ($retryCount -lt $maxRetries) {
+                            Start-Sleep -Seconds 30
+                        }
+                    }
+                }
+                
+                return @{
+                    OriginalName = $job.OriginalName
+                    NewDiskName  = $job.NewDiskName
+                    Lun          = $job.Lun
+                    Caching      = $job.Caching
+                    Disk         = $null
+                    Status       = 'Failed'
+                    Error        = $lastError.Exception.Message
+                }
+            }
+            
+            # Process results
+            foreach ($result in $createdDisks) {
+                if ($result.Status -eq 'Failed') {
+                    throw "Failed to create disk '$($result.NewDiskName)': $($result.Error)"
+                }
+                Write-Success "Disk '$($result.NewDiskName)' $($result.Status.ToLower())."
+                $newDisks.DataDisks += @{
+                    Disk    = $result.Disk
+                    Lun     = $result.Lun
+                    Caching = $result.Caching
+                }
+            }
+        }
+        else {
+            # Sequential disk creation (original behavior)
+            foreach ($job in $dataDiskJobs) {
+                $newDataDisk = New-ZonalDiskFromRestorePoint @($job.Params)
+                $newDisks.DataDisks += @{
+                    Disk    = $newDataDisk
+                    Lun     = $job.Lun
+                    Caching = $job.Caching
+                }
+            }
         }
     }
     else {
-        Write-Info "[WhatIf] Would create zonal data disk '$($dataDisk.Name)' in zone $TargetZone."
+        foreach ($dataDisk in $diskInfo.DataDisks) {
+            Write-Info "[WhatIf] Would create zonal data disk '$($dataDisk.Name)' in zone $TargetZone."
+        }
     }
 }
 
@@ -1324,11 +1735,16 @@ Write-Success "All zonal disks created."
 #region Step 10: Create New NIC
 Write-StepHeader "10" "Create New NIC"
 
-# Use the same NIC name since it's in a different resource group
-$newNicName = $nicConfig.Name
+# Use a different NIC name if same resource group to avoid conflict
+$newNicName = if ($sameResourceGroup) {
+    "$($nicConfig.Name)-z$TargetZone"
+} else {
+    $nicConfig.Name
+}
 
 Write-Info "Creating new NIC based on source NIC configuration..."
 Write-Detail "Source NIC: $($nicConfig.Name)"
+Write-Detail "New NIC: $newNicName"
 Write-Detail "New NIC will get a dynamic IP assigned by Azure"
 
 if ($PSCmdlet.ShouldProcess($newNicName, "Create new NIC")) {
@@ -1385,7 +1801,8 @@ if ($PSCmdlet.ShouldProcess($NewVMName, "Create zonal VM in zone $TargetZone")) 
             -ManagedDiskId $newDisks.OsDisk.Id `
             -CreateOption Attach `
             -Windows `
-            -Caching $osDiskCaching
+            -Caching $osDiskCaching `
+            -DeleteOption Delete
     }
     else {
         $newVmConfig = Set-AzVMOSDisk `
@@ -1394,7 +1811,8 @@ if ($PSCmdlet.ShouldProcess($NewVMName, "Create zonal VM in zone $TargetZone")) 
             -ManagedDiskId $newDisks.OsDisk.Id `
             -CreateOption Attach `
             -Linux `
-            -Caching $osDiskCaching
+            -Caching $osDiskCaching `
+            -DeleteOption Delete
     }
     
     # Attach data disks
@@ -1413,11 +1831,12 @@ if ($PSCmdlet.ShouldProcess($NewVMName, "Create zonal VM in zone $TargetZone")) 
             -ManagedDiskId $dataDisk.Id `
             -Lun $dataDiskEntry.Lun `
             -CreateOption Attach `
-            -Caching $dataDiskCaching
+            -Caching $dataDiskCaching `
+            -DeleteOption Delete
     }
     
-    # Add NIC
-    $newVmConfig = Add-AzVMNetworkInterface -VM $newVmConfig -Id $newNic.Id -Primary
+    # Add NIC (with delete option so NIC is deleted when VM is deleted)
+    $newVmConfig = Add-AzVMNetworkInterface -VM $newVmConfig -Id $newNic.Id -Primary -DeleteOption Delete
     
     # Set boot diagnostics
     $bootDiagEnabled = $vmConfig.DiagnosticsProfile -and $vmConfig.DiagnosticsProfile.BootDiagnostics -and $vmConfig.DiagnosticsProfile.BootDiagnostics.Enabled
@@ -1570,9 +1989,8 @@ if ($sourceExtensions -and $sourceExtensions.Count -gt 0) {
         Write-Detail "Version: $($ext.TypeHandlerVersion)"
         Write-Host ""
     }
-    Write-Warning "Extensions are NOT automatically installed on the new VM."
-    Write-Warning "Please manually install required extensions on '$NewVMName' using:"
-    Write-Host "  Set-AzVMExtension -ResourceGroupName '$TargetResourceGroupName' -VMName '$NewVMName' ..." -ForegroundColor Gray
+    Write-Warning "Extensions are NOT automatically copied to the new VM."
+    Write-Warning "They may be installed via Azure Policy or other automation, or you can install them manually."
 }
 else {
     Write-Success "No extensions were installed on the source VM."
@@ -1580,26 +1998,19 @@ else {
 
 #endregion
 
-#region Step 13: Cleanup Snapshots
-Write-StepHeader "13" "Cleanup Snapshots"
+#region Step 13: Cleanup Restore Point Collection
+Write-StepHeader "13" "Cleanup Restore Point Collection"
 
-if ($PSCmdlet.ShouldProcess("Snapshots", "Delete temporary snapshots")) {
-    # Delete OS disk snapshot
-    if ($snapshots.OsDisk) {
-        Write-Info "Deleting OS disk snapshot '$($snapshots.OsDisk.Name)'..."
-        Remove-AzSnapshot -ResourceGroupName $TargetResourceGroupName -SnapshotName $snapshots.OsDisk.Name -Force | Out-Null
-        Write-Success "OS disk snapshot deleted."
-    }
-    
-    # Delete data disk snapshots
-    foreach ($dataDiskInfo in $snapshots.DataDisks) {
-        Write-Info "Deleting data disk snapshot '$($dataDiskInfo.Snapshot.Name)'..."
-        Remove-AzSnapshot -ResourceGroupName $TargetResourceGroupName -SnapshotName $dataDiskInfo.Snapshot.Name -Force | Out-Null
-        Write-Success "Data disk snapshot deleted."
+if ($PSCmdlet.ShouldProcess("Restore Point Collection", "Delete temporary restore point collection")) {
+    # Delete the restore point collection (this also deletes all restore points within it)
+    if ($restorePointData.CollectionName) {
+        Write-Info "Deleting restore point collection '$($restorePointData.CollectionName)'..."
+        Remove-AzRestorePointCollection -ResourceGroupName $ResourceGroupName -Name $restorePointData.CollectionName | Out-Null
+        Write-Success "Restore point collection deleted."
     }
 }
 else {
-    Write-Info "[WhatIf] Would delete all temporary snapshots."
+    Write-Info "[WhatIf] Would delete restore point collection '$($restorePointData.CollectionName)'."
 }
 
 #endregion
@@ -1628,14 +2039,14 @@ if ($sourcePPGId) {
 Write-Host "`n"
 
 # For new resources, use actual names if created, otherwise use expected names from source
-$newOsDiskName = $newDisks.OsDisk ? $newDisks.OsDisk.Name : $diskInfo.OsDisk.Name
+$newOsDiskName = $newDisks.OsDisk ? $newDisks.OsDisk.Name : ($sameResourceGroup ? "$($diskInfo.OsDisk.Name)-z$TargetZone" : $diskInfo.OsDisk.Name)
 $targetOsDiskSkuDisplay = $TargetOsDiskSku ? $TargetOsDiskSku : $diskInfo.OsDisk.Sku
 
 Write-Host "New Resources Created - Zone $TargetZone :" -ForegroundColor Cyan
 Write-Host "  VM:                     $NewVMName in $TargetResourceGroupName" -ForegroundColor Gray
 Write-Host "  OS Disk:                $newOsDiskName ($targetOsDiskSkuDisplay)" -ForegroundColor Gray
 foreach ($dd in $diskInfo.DataDisks) {
-    $newDataDiskName = $dd.Name  # Same name since different RG
+    $newDataDiskName = if ($sameResourceGroup) { "$($dd.Name)-z$TargetZone" } else { $dd.Name }
     $targetDataDiskSkuDisplay = $TargetDataDiskSku ? $TargetDataDiskSku : $dd.Sku
     Write-Host "  Data Disk:              $newDataDiskName ($targetDataDiskSkuDisplay)" -ForegroundColor Gray
 }
