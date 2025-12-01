@@ -99,8 +99,9 @@
     - If target RG equals source RG, NewVMName must be different from VMName
     - New VM will have a DIFFERENT IP address than the source
     - VM extensions are NOT automatically installed on the new VM
-    - Proximity Placement Groups: New VM is only added to source PPG if the PPG is compatible
-      with the target zone. PPGs with running regional VMs or VMs in different zones are skipped.
+    - Proximity Placement Groups: If the source VM is in a PPG, the script enforces PPG constraints:
+      * If PPG has running regional VMs: Script stops. Stop those VMs first, then retry.
+      * If PPG is pinned to a different zone: Script stops. Use -TargetZone matching the PPG zone.
 #>
 
 #Requires -Version 7.0
@@ -182,6 +183,78 @@ function Write-Detail {
     Write-Host "  $Message" -ForegroundColor Gray
 }
 
+function Get-PhysicalZone {
+    <#
+    .SYNOPSIS
+        Gets the physical availability zone mapped to a logical zone for the current subscription and location.
+    .DESCRIPTION
+        Uses the Azure List Locations API to retrieve the availability zone mappings between logical
+        and physical zones for the current subscription. This helps identify which physical datacenter
+        corresponds to a logical zone number.
+    .PARAMETER Location
+        The Azure region location (e.g., 'eastus', 'westeurope').
+    .PARAMETER LogicalZone
+        The logical availability zone number (1, 2, or 3).
+    .OUTPUTS
+        String containing the physical zone identifier, or $null if mapping cannot be determined.
+    .EXAMPLE
+        Get-PhysicalZone -Location 'eastus' -LogicalZone 2
+        # Returns something like 'eastus-az2' or the physical zone ID
+    #>
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Location,
+        
+        [Parameter(Mandatory = $true)]
+        [ValidateRange(1, 3)]
+        [int]$LogicalZone
+    )
+    
+    try {
+        $subscriptionId = (Get-AzContext).Subscription.Id
+        $response = Invoke-AzRestMethod -Method GET -Path "/subscriptions/$subscriptionId/locations?api-version=2022-12-01"
+        
+        if ($response.StatusCode -ne 200) {
+            Write-Warning "Failed to retrieve location information. Status code: $($response.StatusCode)"
+            return $null
+        }
+        
+        $locations = ($response.Content | ConvertFrom-Json).value
+        
+        # Find the location (normalize to lowercase for comparison)
+        $locationInfo = $locations | Where-Object { 
+            $_.name -eq $Location.ToLower() -or 
+            $_.displayName -eq $Location 
+        }
+        
+        if (-not $locationInfo) {
+            Write-Warning "Location '$Location' not found in subscription locations."
+            return $null
+        }
+        
+        if (-not $locationInfo.availabilityZoneMappings) {
+            Write-Warning "No availability zone mappings found for location '$Location'."
+            return $null
+        }
+        
+        # Find the mapping for the specified logical zone
+        $zoneMapping = $locationInfo.availabilityZoneMappings | Where-Object { 
+            $_.logicalZone -eq $LogicalZone.ToString() 
+        }
+        
+        if (-not $zoneMapping) {
+            Write-Warning "No mapping found for logical zone $LogicalZone in location '$Location'."
+            return $null
+        }
+        
+        return $zoneMapping.physicalZone
+    }
+    catch {
+        Write-Warning "Error retrieving physical zone mapping: $($_.Exception.Message)"
+        return $null
+    }
+}
+
 function Get-VMDiskInfo {
     <#
     .SYNOPSIS
@@ -205,6 +278,7 @@ function Get-VMDiskInfo {
         Tier                 = $osDisk.Tier
         LogicalSectorSize    = $osDisk.CreationData.LogicalSectorSize
         DiskEncryptionSetId  = $osDisk.Encryption?.DiskEncryptionSetId
+        Zones                = $osDisk.Zones
     }
     
     # Get data disk details
@@ -222,6 +296,7 @@ function Get-VMDiskInfo {
             Tier                 = $disk.Tier
             LogicalSectorSize    = $disk.CreationData.LogicalSectorSize
             DiskEncryptionSetId  = $disk.Encryption?.DiskEncryptionSetId
+            Zones                = $disk.Zones
         }
     }
     
@@ -474,7 +549,7 @@ function New-VMRestorePoint {
     Write-Info "Creating restore point '$RestorePointName' (mode: $ConsistencyMode)..."
     
     # Create the restore point
-    $restorePoint = New-AzRestorePoint `
+    $null = New-AzRestorePoint `
         -ResourceGroupName $ResourceGroupName `
         -RestorePointCollectionName $CollectionName `
         -Name $RestorePointName `
@@ -685,21 +760,6 @@ function New-ZonalDiskFromRestorePoint {
     }
     
     throw "Failed to create disk '$NewDiskName' after $MaxRetries attempts. Last error: $($lastError.Exception.Message)"
-}
-
-function Get-TargetDiskName {
-    <#
-    .SYNOPSIS
-        Returns the target disk name. Currently returns the same name as source
-        since resources are created in a different resource group (no conflict).
-        This function exists as an extension point for future naming customization.
-    #>
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$OriginalName
-    )
-    
-    return $OriginalName
 }
 
 function Test-DiskSkuAvailability {
@@ -920,10 +980,10 @@ function Copy-NetworkInterfaceConfig {
 #region Main Script
 
 Write-Host "`n"
-Write-Host "╔══════════════════════════════════════════════════════════════════════════════╗" -ForegroundColor Magenta
-Write-Host "║           AZURE VM ZONAL COPY SCRIPT                                         ║" -ForegroundColor Magenta
-Write-Host "║           Creates a copy of a VM in a target availability zone               ║" -ForegroundColor Magenta
-Write-Host "╚══════════════════════════════════════════════════════════════════════════════╝" -ForegroundColor Magenta
+Write-Host "╔══════════════════════════════════════════════════════════════════════════════╗" -ForegroundColor Cyan
+Write-Host "║           AZURE VM ZONAL COPY SCRIPT                                         ║" -ForegroundColor Cyan
+Write-Host "║           Creates a copy of a VM in a target availability zone               ║" -ForegroundColor Cyan
+Write-Host "╚══════════════════════════════════════════════════════════════════════════════╝" -ForegroundColor Cyan
 Write-Host "`n"
 
 # Verify Azure context is set
@@ -1041,6 +1101,29 @@ Write-Info "Gathering disk information..."
 $diskInfo = Get-VMDiskInfo -VM $vmConfig
 Write-Success "Found OS disk and $($diskInfo.DataDisks.Count) data disk(s)."
 
+# Display disk details
+Write-Host ""
+Write-Host "  DISK INVENTORY" -ForegroundColor Yellow
+Write-Host "  ──────────────────────────────────────────────────────────────────────────────" -ForegroundColor Gray
+
+# OS Disk
+$osEncType = $diskInfo.OsDisk.DiskEncryptionSetId ? "SSE+CMK" : "SSE+PMK"
+$osZoneInfo = ($diskInfo.OsDisk.Zones -and $diskInfo.OsDisk.Zones.Count -gt 0) ? "Zone $($diskInfo.OsDisk.Zones[0])" : "Regional"
+Write-Host "  OS Disk:" -ForegroundColor Cyan
+Write-Host "    $($diskInfo.OsDisk.Name)" -ForegroundColor White
+Write-Host "      SKU: $($diskInfo.OsDisk.Sku) | Size: $($diskInfo.OsDisk.DiskSizeGB) GB | $osZoneInfo | Encryption: $osEncType" -ForegroundColor Gray
+
+# Data Disks
+if ($diskInfo.DataDisks.Count -gt 0) {
+    Write-Host "  Data Disks ($($diskInfo.DataDisks.Count)):" -ForegroundColor Cyan
+    foreach ($dd in $diskInfo.DataDisks | Sort-Object { $_.Lun }) {
+        $ddEncType = $dd.DiskEncryptionSetId ? "SSE+CMK" : "SSE+PMK"
+        $ddZoneInfo = ($dd.Zones -and $dd.Zones.Count -gt 0) ? "Zone $($dd.Zones[0])" : "Regional"
+        Write-Host "    LUN $($dd.Lun): $($dd.Name) | $($dd.Sku) | $($dd.DiskSizeGB) GB | $ddZoneInfo | $ddEncType" -ForegroundColor Gray
+    }
+}
+Write-Host ""
+
 # Check VM restore point compatibility
 Write-Info "Checking VM restore point compatibility..."
 $rpCompatibility = Test-VMRestorePointCompatibility -VM $vmConfig -DiskInfo $diskInfo -ConsistencyMode 'CrashConsistent'
@@ -1105,14 +1188,12 @@ if ($TargetDataDiskSku) {
     Write-Detail "Data Disk SKU: each disk keeps source SKU"
 }
 
-$osDiskCaching = $diskInfo.OsDisk.Caching
-
 # Validate OS disk caching - only check if SOURCE disk is already Ultra/PremiumV2 and keeping that SKU
 # (If converting TO Ultra/PremiumV2, we'll set caching to None on the new VM regardless of source)
 $sourceOsSku = $diskInfo.OsDisk.Sku
 if ($sourceOsSku -in @('PremiumV2_LRS', 'UltraSSD_LRS') -and -not $TargetOsDiskSku) {
-    if ($osDiskCaching -ne 'None') {
-        throw "OS Disk '$($diskInfo.OsDisk.Name)' is $sourceOsSku which only supports Caching='None'. Current caching is '$osDiskCaching'. Please change the caching setting on the source disk before running this script."
+    if ($diskInfo.OsDisk.Caching -ne 'None') {
+        throw "OS Disk '$($diskInfo.OsDisk.Name)' is $sourceOsSku which only supports Caching='None'. Current caching is '$($diskInfo.OsDisk.Caching)'. Please change the caching setting on the source disk before running this script."
     }
     Write-Success "OS Disk caching validated for $sourceOsSku."
 }
@@ -1244,6 +1325,23 @@ if ($restrictions) {
 }
 
 Write-Success "VM size '$vmSize' is available in zone $TargetZone."
+
+# Display physical zone mapping
+Write-Info "Retrieving physical zone mapping for logical zone $TargetZone..."
+$physicalZone = Get-PhysicalZone -Location $location -LogicalZone $TargetZone
+if ($physicalZone) {
+    Write-Host ""
+    Write-Host "  ZONE MAPPING INFORMATION" -ForegroundColor Yellow
+    Write-Host "  Target Logical Zone  : $TargetZone" -ForegroundColor Yellow
+    Write-Host "  Physical Zone        : $physicalZone" -ForegroundColor Yellow
+    Write-Host "  Location             : $location" -ForegroundColor Yellow
+    Write-Host ""
+    Write-Detail "Physical zones are shared across subscriptions with the same zone mapping."
+    Write-Detail "Different subscriptions may have different logical-to-physical zone mappings."
+}
+else {
+    Write-Warning "Could not determine physical zone mapping. This may be due to API limitations or the region not supporting zone mappings."
+}
 
 #endregion
 
@@ -1394,41 +1492,53 @@ if ($sourcePPGId) {
             $script:targetPPGObject = $sourcePPG
         }
         else {
-            # PPG is NOT compatible - warn user with specific reason
+            # PPG is NOT compatible - stop the script with specific error
             Write-Host ""
             
             if ($ppgCheck.RunningRegionalVMs.Count -gt 0) {
                 # Running regional VMs physically pin the PPG
-                Write-Host "WARNING: PPG Physical Pinning Conflict!" -ForegroundColor Red
+                Write-Host "╔══════════════════════════════════════════════════════════════════════════════╗" -ForegroundColor Red
+                Write-Host "║                    PPG PHYSICAL PINNING CONFLICT                             ║" -ForegroundColor Red
+                Write-Host "╚══════════════════════════════════════════════════════════════════════════════╝" -ForegroundColor Red
+                Write-Host ""
                 Write-Host "  PPG '$sourcePpgName' has running regional (non-zonal) VMs:" -ForegroundColor Yellow
                 foreach ($runningVm in $ppgCheck.RunningRegionalVMs) {
                     Write-Host "    - $runningVm" -ForegroundColor Yellow
                 }
                 Write-Host ""
-                Write-Host "  Running regional VMs physically pin the PPG to specific hardware." -ForegroundColor Yellow
-                Write-Host "  This hardware may not be in the target Zone $TargetZone." -ForegroundColor Yellow
+                Write-Host "  Running regional VMs physically pin the PPG to specific hardware." -ForegroundColor White
+                Write-Host "  This hardware may not be in the target Zone $TargetZone." -ForegroundColor White
                 Write-Host ""
-                Write-Host "  The new VM will NOT be added to the source PPG." -ForegroundColor Yellow
+                Write-Host "  ACTION REQUIRED:" -ForegroundColor Cyan
+                Write-Host "    Stop (deallocate) the regional VMs listed above, then re-run this script." -ForegroundColor White
                 Write-Host ""
-                Write-Warning "To use this PPG, first stop the regional VMs listed above, then re-run this script."
+                throw "Cannot proceed: PPG '$sourcePpgName' has running regional VMs that physically pin it. Stop these VMs first."
             }
             elseif ($ppgCheck.PinnedZone) {
                 # Zonal VMs pin the PPG to a different zone
-                Write-Host "WARNING: PPG Zone Mismatch!" -ForegroundColor Red
+                Write-Host "╔══════════════════════════════════════════════════════════════════════════════╗" -ForegroundColor Red
+                Write-Host "║                         PPG ZONE MISMATCH                                    ║" -ForegroundColor Red
+                Write-Host "╚══════════════════════════════════════════════════════════════════════════════╝" -ForegroundColor Red
+                Write-Host ""
                 Write-Host "  PPG '$sourcePpgName' is pinned to Zone $($ppgCheck.PinnedZone)" -ForegroundColor Yellow
                 Write-Host "  Target zone for new VM is Zone $TargetZone" -ForegroundColor Yellow
                 Write-Host ""
-                Write-Host "  PPGs require all VMs to be in the same zone." -ForegroundColor Yellow
-                Write-Host "  The new VM will NOT be added to the source PPG." -ForegroundColor Yellow
+                Write-Host "  PPGs require all VMs to be in the same availability zone." -ForegroundColor White
                 Write-Host ""
-                Write-Warning "To keep the VM in the same PPG, change the target zone to $($ppgCheck.PinnedZone)."
+                Write-Host "  ACTION REQUIRED:" -ForegroundColor Cyan
+                Write-Host "    Change the -TargetZone parameter to $($ppgCheck.PinnedZone) to match the existing VMs in the PPG." -ForegroundColor White
+                Write-Host ""
+                throw "Cannot proceed: PPG '$sourcePpgName' is pinned to Zone $($ppgCheck.PinnedZone), but target zone is $TargetZone. Use -TargetZone $($ppgCheck.PinnedZone) instead."
             }
             else {
                 # Generic incompatibility
-                Write-Host "WARNING: PPG Incompatible!" -ForegroundColor Red
+                Write-Host "╔══════════════════════════════════════════════════════════════════════════════╗" -ForegroundColor Red
+                Write-Host "║                         PPG INCOMPATIBLE                                     ║" -ForegroundColor Red
+                Write-Host "╚══════════════════════════════════════════════════════════════════════════════╝" -ForegroundColor Red
+                Write-Host ""
                 Write-Host "  $($ppgCheck.Message)" -ForegroundColor Yellow
                 Write-Host ""
-                Write-Host "  The new VM will NOT be added to the source PPG." -ForegroundColor Yellow
+                throw "Cannot proceed: PPG '$sourcePpgName' is incompatible with the target zone. $($ppgCheck.Message)"
             }
         }
     }
@@ -1488,14 +1598,14 @@ $restorePointData = @{
 
 if ($PSCmdlet.ShouldProcess($VMName, "Create VM restore point")) {
     # Create restore point collection in source resource group (must be same RG as VM)
-    $rpCollection = New-VMRestorePointCollection `
+    $null = New-VMRestorePointCollection `
         -SourceVMId $vmConfig.Id `
         -ResourceGroupName $ResourceGroupName `
         -CollectionName $rpCollectionName `
         -Location $vmConfig.Location
     
     # Create restore point (crash-consistent)
-    $restorePoint = New-VMRestorePoint `
+    $null = New-VMRestorePoint `
         -ResourceGroupName $ResourceGroupName `
         -CollectionName $rpCollectionName `
         -RestorePointName $rpName `
@@ -1528,9 +1638,9 @@ $newDisks = @{
 if ($PSCmdlet.ShouldProcess("OS Disk", "Create zonal disk in zone $TargetZone")) {
     # Determine new disk name - use suffix if same RG to avoid conflict
     $newOsDiskName = if ($sameResourceGroup) {
-        Get-TargetDiskName -OriginalName "$($diskInfo.OsDisk.Name)-z$TargetZone"
+        "$($diskInfo.OsDisk.Name)-z$TargetZone"
     } else {
-        Get-TargetDiskName -OriginalName $diskInfo.OsDisk.Name
+        $diskInfo.OsDisk.Name
     }
     
     # Use target SKU if specified, otherwise keep source SKU
@@ -1568,9 +1678,9 @@ if ($diskInfo.DataDisks.Count -gt 0) {
         foreach ($dataDisk in $diskInfo.DataDisks) {
             # Determine new disk name - use suffix if same RG to avoid conflict
             $newDataDiskName = if ($sameResourceGroup) {
-                Get-TargetDiskName -OriginalName "$($dataDisk.Name)-z$TargetZone"
+                "$($dataDisk.Name)-z$TargetZone"
             } else {
-                Get-TargetDiskName -OriginalName $dataDisk.Name
+                $dataDisk.Name
             }
             
             # Use target SKU if specified, otherwise keep source SKU
