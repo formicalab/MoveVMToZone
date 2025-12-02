@@ -984,7 +984,6 @@ Write-Host "╔═════════════════════�
 Write-Host "║           AZURE VM ZONAL COPY SCRIPT                                         ║" -ForegroundColor Cyan
 Write-Host "║           Creates a copy of a VM in a target availability zone               ║" -ForegroundColor Cyan
 Write-Host "╚══════════════════════════════════════════════════════════════════════════════╝" -ForegroundColor Cyan
-Write-Host "`n"
 
 # Verify Azure context is set
 $currentContext = Get-AzContext
@@ -996,69 +995,110 @@ Write-Info "Using subscription: $($currentContext.Subscription.Name) ($($current
 #region Step 1: Retrieve and Validate Source VM
 Write-StepHeader "1" "Retrieve and Validate Source VM"
 
+# --- GATHER ALL INFORMATION FIRST ---
+Write-Info "Looking for the source VM..."
 $vm = Get-AzVM -ResourceGroupName $ResourceGroupName -Name $VMName -Status
 if (-not $vm) {
     throw "VM '$VMName' not found in resource group '$ResourceGroupName'."
 }
-
 $vmConfig = Get-AzVM -ResourceGroupName $ResourceGroupName -Name $VMName
 
-# Check for multiple NICs
+# Check for multiple NICs early
 if ($vmConfig.NetworkProfile.NetworkInterfaces.Count -gt 1) {
     throw "VM '$VMName' has $($vmConfig.NetworkProfile.NetworkInterfaces.Count) NICs. This script only supports VMs with a single NIC."
 }
 
-Write-Success "VM '$VMName' found."
-Write-Detail "Location: $($vmConfig.Location)"
-Write-Detail "VM Size: $($vmConfig.HardwareProfile.VmSize)"
-Write-Detail "Current Zone: $(($vmConfig.Zones -and $vmConfig.Zones.Count -gt 0) ? $vmConfig.Zones[0] : 'None (Regional)')"
-Write-Detail "NICs: $($vmConfig.NetworkProfile.NetworkInterfaces.Count)"
+Write-Info "Gathering NIC configuration..."
+$nicConfig = Get-VMNicConfig -VM $vmConfig
+$primaryIpConfig = $nicConfig.IpConfigurations | Where-Object { $_.Primary -eq $true }
+$sourceIpAddress = $primaryIpConfig.PrivateIpAddress
+$sourceIpAllocation = $primaryIpConfig.PrivateIpAllocationMethod
 
-# Set default target resource group if not specified
-if (-not $TargetResourceGroupName) {
-    $TargetResourceGroupName = $ResourceGroupName
-    Write-Info "Target resource group not specified. Using source resource group: '$TargetResourceGroupName'"
-}
-
-# Check if target and source resource groups are the same
-$sameResourceGroup = ($TargetResourceGroupName -eq $ResourceGroupName)
-
-# Validate target resource group exists
-$targetRg = Get-AzResourceGroup -Name $TargetResourceGroupName -ErrorAction SilentlyContinue
-if (-not $targetRg) {
-    throw "Target resource group '$TargetResourceGroupName' does not exist. Please create it first."
-}
-Write-Success "Target resource group '$TargetResourceGroupName' exists."
-
-# Handle VM naming based on whether we're in the same or different resource group
-if ($sameResourceGroup) {
-    # Same resource group - NewVMName is REQUIRED and must be different
-    if (-not $NewVMName) {
-        throw "When target resource group is the same as source, you must specify a different NewVMName. Source VM: '$VMName'"
+# Check for public IPs
+$hasPublicIp = $false
+$publicIpNames = @()
+foreach ($ipConfig in $nicConfig.IpConfigurations) {
+    if ($ipConfig.PublicIpAddressId) {
+        $hasPublicIp = $true
+        $publicIpNames += $ipConfig.PublicIpAddressId.Split('/')[-1]
     }
-    if ($NewVMName -eq $VMName) {
-        throw "NewVMName ('$NewVMName') must be different from source VMName ('$VMName') when using the same resource group."
-    }
-    Write-Info "Same resource group scenario: new VM will be named '$NewVMName'"
 }
-else {
-    # Different resource group - NewVMName defaults to VMName if not specified
-    if (-not $NewVMName) {
-        $NewVMName = $VMName
-    }
-    Write-Info "Different resource group scenario: new VM will be named '$NewVMName' in '$TargetResourceGroupName'"
-}
-Write-Detail "New VM Name: $NewVMName"
 
-# Check if new VM already exists
-$existingVM = Get-AzVM -ResourceGroupName $TargetResourceGroupName -Name $NewVMName -ErrorAction SilentlyContinue
-if ($existingVM) {
-    throw "A VM named '$NewVMName' already exists in resource group '$TargetResourceGroupName'."
+Write-Info "Gathering disk information..."
+$diskInfo = Get-VMDiskInfo -VM $vmConfig
+
+Write-Info "Checking Azure Disk Encryption status..."
+$adeStatus = Get-AzVmDiskEncryptionStatus -ResourceGroupName $ResourceGroupName -VMName $VMName -ErrorAction SilentlyContinue
+
+Write-Info "Checking restore point compatibility..."
+$rpCompatibility = Test-VMRestorePointCompatibility -VM $vmConfig -DiskInfo $diskInfo -ConsistencyMode 'CrashConsistent'
+
+Write-Info "Gathering extension list..."
+$sourceExtensions = @(Get-VMExtensionsList -VM $vmConfig)
+
+# --- DISPLAY ALL GATHERED INFORMATION ---
+Write-Host ""
+Write-Host "  VM DETAILS" -ForegroundColor Yellow
+Write-Host "  ──────────────────────────────────────────────────────────────────────────────" -ForegroundColor Gray
+Write-Host "  Name       : $VMName" -ForegroundColor Gray
+Write-Host "  Location   : $($vmConfig.Location)" -ForegroundColor Gray
+Write-Host "  VM Size    : $($vmConfig.HardwareProfile.VmSize)" -ForegroundColor Gray
+Write-Host "  Zone       : $(($vmConfig.Zones -and $vmConfig.Zones.Count -gt 0) ? $vmConfig.Zones[0] : 'None (Regional)')" -ForegroundColor Gray
+Write-Host ""
+
+Write-Host "  NETWORK CONFIGURATION" -ForegroundColor Yellow
+Write-Host "  ──────────────────────────────────────────────────────────────────────────────" -ForegroundColor Gray
+Write-Host "  NIC        : $($nicConfig.Name)" -ForegroundColor Gray
+Write-Host "  IP Address : $sourceIpAddress ($sourceIpAllocation)" -ForegroundColor Gray
+if ($hasPublicIp) {
+    Write-Host "  Public IP  : $($publicIpNames -join ', ') (will NOT be copied)" -ForegroundColor Yellow
+} else {
+    Write-Host "  Public IP  : None" -ForegroundColor Gray
+}
+Write-Host ""
+
+Write-Host "  DISK INVENTORY" -ForegroundColor Yellow
+Write-Host "  ──────────────────────────────────────────────────────────────────────────────" -ForegroundColor Gray
+
+# OS Disk
+$osEncType = $diskInfo.OsDisk.DiskEncryptionSetId ? "SSE+CMK" : "SSE+PMK"
+$osZoneInfo = ($diskInfo.OsDisk.Zones -and $diskInfo.OsDisk.Zones.Count -gt 0) ? "Zone $($diskInfo.OsDisk.Zones[0])" : "Regional"
+Write-Host "  OS Disk:" -ForegroundColor Cyan
+Write-Host "    $($diskInfo.OsDisk.Name)" -ForegroundColor White
+Write-Host "      SKU: $($diskInfo.OsDisk.Sku) | Size: $($diskInfo.OsDisk.DiskSizeGB) GB | $osZoneInfo | Encryption: $osEncType" -ForegroundColor Gray
+
+# Data Disks
+if ($diskInfo.DataDisks.Count -gt 0) {
+    Write-Host "  Data Disks ($($diskInfo.DataDisks.Count)):" -ForegroundColor Cyan
+    foreach ($dd in $diskInfo.DataDisks | Sort-Object { $_.Lun }) {
+        $ddEncType = $dd.DiskEncryptionSetId ? "SSE+CMK" : "SSE+PMK"
+        $ddZoneInfo = ($dd.Zones -and $dd.Zones.Count -gt 0) ? "Zone $($dd.Zones[0])" : "Regional"
+        Write-Host "    LUN $($dd.Lun): $($dd.Name) | $($dd.Sku) | $($dd.DiskSizeGB) GB | $ddZoneInfo | $ddEncType" -ForegroundColor Gray
+    }
+}
+Write-Host ""
+
+if ($sourceExtensions.Count -gt 0) {
+    Write-Host "  EXTENSIONS ($($sourceExtensions.Count))" -ForegroundColor Yellow
+    Write-Host "  ──────────────────────────────────────────────────────────────────────────────" -ForegroundColor Gray
+    foreach ($ext in $sourceExtensions) {
+        Write-Host "    $($ext.Name) ($($ext.Publisher))" -ForegroundColor Gray
+    }
+    Write-Host ""
+}
+
+# --- RUN VALIDATION CHECKS ---
+Write-Host "  VALIDATION CHECKS" -ForegroundColor Yellow
+Write-Host "  ──────────────────────────────────────────────────────────────────────────────" -ForegroundColor Gray
+
+# Public IP warning (NIC-related - first to match gathering order)
+if ($hasPublicIp) {
+    Write-Host "  [!] Public IPs will NOT be copied (manual action required)" -ForegroundColor Yellow
+} else {
+    Write-Host "  [✓] No public IPs to migrate" -ForegroundColor Green
 }
 
 # Check for Azure Disk Encryption (ADE)
-Write-Info "Checking for Azure Disk Encryption (ADE)..."
-$adeStatus = Get-AzVmDiskEncryptionStatus -ResourceGroupName $ResourceGroupName -VMName $VMName -ErrorAction SilentlyContinue
 if ($adeStatus) {
     $osEncrypted = $adeStatus.OsVolumeEncrypted -eq 'Encrypted'
     $dataEncrypted = $adeStatus.DataVolumesEncrypted -eq 'Encrypted'
@@ -1090,44 +1130,9 @@ if ($adeStatus) {
         throw "Cannot proceed: VM '$VMName' has Azure Disk Encryption enabled. Please disable ADE before running this script."
     }
 }
-Write-Success "No Azure Disk Encryption (ADE) detected."
-
-#endregion
-
-#region Step 2: Gather Source VM Configuration
-Write-StepHeader "2" "Gather Source VM Configuration"
-
-Write-Info "Gathering disk information..."
-$diskInfo = Get-VMDiskInfo -VM $vmConfig
-Write-Success "Found OS disk and $($diskInfo.DataDisks.Count) data disk(s)."
-
-# Display disk details
-Write-Host ""
-Write-Host "  DISK INVENTORY" -ForegroundColor Yellow
-Write-Host "  ──────────────────────────────────────────────────────────────────────────────" -ForegroundColor Gray
-
-# OS Disk
-$osEncType = $diskInfo.OsDisk.DiskEncryptionSetId ? "SSE+CMK" : "SSE+PMK"
-$osZoneInfo = ($diskInfo.OsDisk.Zones -and $diskInfo.OsDisk.Zones.Count -gt 0) ? "Zone $($diskInfo.OsDisk.Zones[0])" : "Regional"
-Write-Host "  OS Disk:" -ForegroundColor Cyan
-Write-Host "    $($diskInfo.OsDisk.Name)" -ForegroundColor White
-Write-Host "      SKU: $($diskInfo.OsDisk.Sku) | Size: $($diskInfo.OsDisk.DiskSizeGB) GB | $osZoneInfo | Encryption: $osEncType" -ForegroundColor Gray
-
-# Data Disks
-if ($diskInfo.DataDisks.Count -gt 0) {
-    Write-Host "  Data Disks ($($diskInfo.DataDisks.Count)):" -ForegroundColor Cyan
-    foreach ($dd in $diskInfo.DataDisks | Sort-Object { $_.Lun }) {
-        $ddEncType = $dd.DiskEncryptionSetId ? "SSE+CMK" : "SSE+PMK"
-        $ddZoneInfo = ($dd.Zones -and $dd.Zones.Count -gt 0) ? "Zone $($dd.Zones[0])" : "Regional"
-        Write-Host "    LUN $($dd.Lun): $($dd.Name) | $($dd.Sku) | $($dd.DiskSizeGB) GB | $ddZoneInfo | $ddEncType" -ForegroundColor Gray
-    }
-}
-Write-Host ""
+Write-Host "  [✓] No Azure Disk Encryption (ADE)" -ForegroundColor Green
 
 # Check VM restore point compatibility
-Write-Info "Checking VM restore point compatibility..."
-$rpCompatibility = Test-VMRestorePointCompatibility -VM $vmConfig -DiskInfo $diskInfo -ConsistencyMode 'CrashConsistent'
-
 if ($rpCompatibility.Warnings.Count -gt 0) {
     Write-Host ""
     Write-Host "╔══════════════════════════════════════════════════════════════════════════════╗" -ForegroundColor Yellow
@@ -1155,145 +1160,100 @@ if (-not $rpCompatibility.IsCompatible) {
     Write-Host ""
     throw "Cannot proceed: VM '$VMName' is not compatible with VM restore points."
 }
+Write-Host "  [✓] VM is compatible with restore points" -ForegroundColor Green
 
-Write-Success "VM is compatible with restore points."
-
-Write-Info "Gathering NIC configuration..."
-$nicConfig = Get-VMNicConfig -VM $vmConfig
-Write-Success "NIC configuration gathered."
-
-Write-Info "Gathering extension list..."
-$sourceExtensions = @(Get-VMExtensionsList -VM $vmConfig)
-Write-Success "Found $($sourceExtensions.Count) extension(s)."
-
-#endregion
-
-#region Step 3: Validate Disk Caching Settings
-Write-StepHeader "3" "Validate Disk SKU and Caching Settings"
-
-# Determine effective target SKUs
-$effectiveOsDiskSku = $TargetOsDiskSku ? $TargetOsDiskSku : $diskInfo.OsDisk.Sku
-$effectiveDataDiskSku = $TargetDataDiskSku  # May be null/empty, meaning use source SKU per disk
-
-# Display SKU conversion info
-if ($TargetOsDiskSku -and $TargetOsDiskSku -ne $diskInfo.OsDisk.Sku) {
-    Write-Info "OS Disk SKU conversion: $($diskInfo.OsDisk.Sku) -> $TargetOsDiskSku"
-} else {
-    Write-Detail "OS Disk SKU: $($diskInfo.OsDisk.Sku) (unchanged)"
-}
-
-if ($TargetDataDiskSku) {
-    Write-Info "Data Disk SKU conversion: all data disks will use $TargetDataDiskSku"
-} else {
-    Write-Detail "Data Disk SKU: each disk keeps source SKU"
-}
-
-# Validate OS disk caching - only check if SOURCE disk is already Ultra/PremiumV2 and keeping that SKU
-# (If converting TO Ultra/PremiumV2, we'll set caching to None on the new VM regardless of source)
+# Validate disk caching for Ultra/PremiumV2 disks
 $sourceOsSku = $diskInfo.OsDisk.Sku
 if ($sourceOsSku -in @('PremiumV2_LRS', 'UltraSSD_LRS') -and -not $TargetOsDiskSku) {
     if ($diskInfo.OsDisk.Caching -ne 'None') {
         throw "OS Disk '$($diskInfo.OsDisk.Name)' is $sourceOsSku which only supports Caching='None'. Current caching is '$($diskInfo.OsDisk.Caching)'. Please change the caching setting on the source disk before running this script."
     }
-    Write-Success "OS Disk caching validated for $sourceOsSku."
 }
 
-# Validate data disk caching - only check if SOURCE disk is already Ultra/PremiumV2 and keeping that SKU
-# (If converting TO Ultra/PremiumV2, we'll set caching to None on the new VM regardless of source)
 foreach ($dataDisk in $diskInfo.DataDisks) {
     $sourceSku = $dataDisk.Sku
-    # Only validate if source is Ultra/PremiumV2 AND we're NOT converting to a different SKU
     if ($sourceSku -in @('PremiumV2_LRS', 'UltraSSD_LRS') -and -not $TargetDataDiskSku) {
         if ($dataDisk.Caching -ne 'None') {
             throw "Data Disk '$($dataDisk.Name)' is $sourceSku which only supports Caching='None'. Current caching is '$($dataDisk.Caching)'. Please change the caching setting on the source disk before running this script."
         }
     }
 }
+Write-Host "  [✓] Disk caching settings valid" -ForegroundColor Green
 
-Write-Success "All disk caching settings validated."
-
-# Validate Premium SSD v2 / Ultra SSD availability in target zone
-$skusToValidate = @()
-
-# Check OS disk target SKU
-if ($effectiveOsDiskSku -in @('PremiumV2_LRS', 'UltraSSD_LRS')) {
-    $skusToValidate += $effectiveOsDiskSku
-}
-
-# Check data disk target SKU
-if ($effectiveDataDiskSku -in @('PremiumV2_LRS', 'UltraSSD_LRS')) {
-    $skusToValidate += $effectiveDataDiskSku
-}
-
-# Also check source disks if keeping their SKU
-if (-not $TargetOsDiskSku -and $diskInfo.OsDisk.Sku -in @('PremiumV2_LRS', 'UltraSSD_LRS')) {
-    $skusToValidate += $diskInfo.OsDisk.Sku
-}
-
-if (-not $TargetDataDiskSku) {
-    foreach ($dataDisk in $diskInfo.DataDisks) {
-        if ($dataDisk.Sku -in @('PremiumV2_LRS', 'UltraSSD_LRS')) {
-            $skusToValidate += $dataDisk.Sku
-        }
-    }
-}
-
-# Validate each unique SKU
-$skusToValidate = @($skusToValidate | Sort-Object -Unique)
-foreach ($skuToValidate in $skusToValidate) {
-    Write-Info "Checking $skuToValidate availability in zone $TargetZone..."
-    $skuCheck = Test-DiskSkuAvailability -SkuName $skuToValidate -Location $vmConfig.Location -Zone $TargetZone
-    
-    if (-not $skuCheck.IsAvailable) {
-        throw $skuCheck.Message
-    }
-    
-    if ($skuCheck.AvailableZones.Count -gt 0) {
-        Write-Success "$skuToValidate is available in zone $TargetZone (available zones: $($skuCheck.AvailableZones -join ', '))"
-    } else {
-        Write-Success "$skuToValidate is available in location '$($vmConfig.Location)'"
-    }
-}
+Write-Host ""
+Write-Success "Source VM validated successfully."
 
 #endregion
 
-#region Step 4: Validate NIC Configuration
-Write-StepHeader "4" "Validate NIC Configuration"
+#region Step 2: Validate Target Configuration
+Write-StepHeader "2" "Validate Target Configuration"
 
-$primaryIpConfig = $nicConfig.IpConfigurations | Where-Object { $_.Primary -eq $true }
-$sourceIpAddress = $primaryIpConfig.PrivateIpAddress
-$sourceIpAllocation = $primaryIpConfig.PrivateIpAllocationMethod
-
-Write-Success "Source NIC: $($nicConfig.Name)"
-Write-Detail "IP Address: $sourceIpAddress ($sourceIpAllocation)"
-Write-Info "New NIC will be assigned a different IP address by Azure (dynamic allocation)."
-
-# Check for public IPs
-$hasPublicIp = $false
-foreach ($ipConfig in $nicConfig.IpConfigurations) {
-    if ($ipConfig.PublicIpAddressId) {
-        $hasPublicIp = $true
-        Write-Warning "IP Configuration '$($ipConfig.Name)' has a Public IP attached."
-    }
+# Set default target resource group if not specified
+if (-not $TargetResourceGroupName) {
+    $TargetResourceGroupName = $ResourceGroupName
 }
 
-if ($hasPublicIp) {
-    Write-Warning "The source VM has Public IP(s) attached. Public IPs will NOT be copied to the new NIC."
-    Write-Warning "You will need to manually attach Public IPs to the new VM if required."
+# Check if target and source resource groups are the same
+$sameResourceGroup = ($TargetResourceGroupName -eq $ResourceGroupName)
+
+# Validate target resource group exists
+$targetRg = Get-AzResourceGroup -Name $TargetResourceGroupName -ErrorAction SilentlyContinue
+if (-not $targetRg) {
+    throw "Target resource group '$TargetResourceGroupName' does not exist. Please create it first."
+}
+
+# Handle VM naming based on whether we're in the same or different resource group
+if ($sameResourceGroup) {
+    # Same resource group - NewVMName is REQUIRED and must be different
+    if (-not $NewVMName) {
+        throw "When target resource group is the same as source, you must specify a different NewVMName. Source VM: '$VMName'"
+    }
+    if ($NewVMName -eq $VMName) {
+        throw "NewVMName ('$NewVMName') must be different from source VMName ('$VMName') when using the same resource group."
+    }
 }
 else {
-    Write-Success "No Public IPs attached to the source NIC."
+    # Different resource group - NewVMName defaults to VMName if not specified
+    if (-not $NewVMName) {
+        $NewVMName = $VMName
+    }
 }
 
-#endregion
+# Check if new VM already exists
+$existingVM = Get-AzVM -ResourceGroupName $TargetResourceGroupName -Name $NewVMName -ErrorAction SilentlyContinue
+if ($existingVM) {
+    throw "A VM named '$NewVMName' already exists in resource group '$TargetResourceGroupName'."
+}
 
-#region Step 5: Validate VM Size Availability in Target Zone
-Write-StepHeader "5" "Validate VM Size Availability in Target Zone"
+# Retrieve physical zone mapping early for display
+$physicalZone = Get-PhysicalZone -Location $vmConfig.Location -LogicalZone $TargetZone
 
+# Display target configuration
+Write-Host ""
+Write-Host "  DESIRED TARGET CONFIGURATION" -ForegroundColor Yellow
+Write-Host "  ──────────────────────────────────────────────────────────────────────────────" -ForegroundColor Gray
+Write-Host "  Resource Group : $TargetResourceGroupName$(if ($sameResourceGroup) { ' (same as source)' } else { ' (different from source)' })" -ForegroundColor Gray
+Write-Host "  New VM Name    : $NewVMName" -ForegroundColor Gray
+$physicalZoneStr = $physicalZone ? " (physical zone: $physicalZone)" : ""
+Write-Host "  Target Zone    : $TargetZone$physicalZoneStr" -ForegroundColor Gray
+# SKU conversion info (inline)
+if ($TargetOsDiskSku -and $TargetOsDiskSku -ne $diskInfo.OsDisk.Sku) {
+    Write-Host "  OS Disk SKU    : $($diskInfo.OsDisk.Sku) -> $TargetOsDiskSku" -ForegroundColor Gray
+}
+if ($TargetDataDiskSku) {
+    Write-Host "  Data Disk SKU  : All will use $TargetDataDiskSku" -ForegroundColor Gray
+}
+Write-Host ""
+
+# Run validations
+Write-Info "Validating target configuration..."
+Write-Host ""
+Write-Host "  VALIDATION CHECKS" -ForegroundColor Yellow
+Write-Host "  ──────────────────────────────────────────────────────────────────────────────" -ForegroundColor Gray
+
+# Validate VM size is available in target zone
 $vmSize = $vmConfig.HardwareProfile.VmSize
 $location = $vmConfig.Location
-
-Write-Info "Checking if VM size '$vmSize' is available in zone $TargetZone..."
 
 $skuAvailability = Get-AzComputeResourceSku -Location $location | 
     Where-Object { 
@@ -1324,29 +1284,47 @@ if ($restrictions) {
     throw "VM size '$vmSize' is restricted in zone $TargetZone at location '$location'. Reason: $reasonCode"
 }
 
-Write-Success "VM size '$vmSize' is available in zone $TargetZone."
+Write-Host "  [✓] VM size '$vmSize' available in zone $TargetZone" -ForegroundColor Green
 
-# Display physical zone mapping
-Write-Info "Retrieving physical zone mapping for logical zone $TargetZone..."
-$physicalZone = Get-PhysicalZone -Location $location -LogicalZone $TargetZone
-if ($physicalZone) {
-    Write-Host ""
-    Write-Host "  ZONE MAPPING INFORMATION" -ForegroundColor Yellow
-    Write-Host "  Target Logical Zone  : $TargetZone" -ForegroundColor Yellow
-    Write-Host "  Physical Zone        : $physicalZone" -ForegroundColor Yellow
-    Write-Host "  Location             : $location" -ForegroundColor Yellow
-    Write-Host ""
-    Write-Detail "Physical zones are shared across subscriptions with the same zone mapping."
-    Write-Detail "Different subscriptions may have different logical-to-physical zone mappings."
+# Validate Premium SSD v2 / Ultra SSD availability in target zone (if applicable)
+$effectiveOsDiskSku = $TargetOsDiskSku ? $TargetOsDiskSku : $diskInfo.OsDisk.Sku
+$effectiveDataDiskSku = $TargetDataDiskSku
+
+$skusToValidate = @()
+if ($effectiveOsDiskSku -in @('PremiumV2_LRS', 'UltraSSD_LRS')) {
+    $skusToValidate += $effectiveOsDiskSku
 }
-else {
-    Write-Warning "Could not determine physical zone mapping. This may be due to API limitations or the region not supporting zone mappings."
+if ($effectiveDataDiskSku -in @('PremiumV2_LRS', 'UltraSSD_LRS')) {
+    $skusToValidate += $effectiveDataDiskSku
 }
+if (-not $TargetOsDiskSku -and $diskInfo.OsDisk.Sku -in @('PremiumV2_LRS', 'UltraSSD_LRS')) {
+    $skusToValidate += $diskInfo.OsDisk.Sku
+}
+if (-not $TargetDataDiskSku) {
+    foreach ($dataDisk in $diskInfo.DataDisks) {
+        if ($dataDisk.Sku -in @('PremiumV2_LRS', 'UltraSSD_LRS')) {
+            $skusToValidate += $dataDisk.Sku
+        }
+    }
+}
+
+$skusToValidate = @($skusToValidate | Sort-Object -Unique)
+foreach ($skuToValidate in $skusToValidate) {
+    $skuCheck = Test-DiskSkuAvailability -SkuName $skuToValidate -Location $vmConfig.Location -Zone $TargetZone
+    
+    if (-not $skuCheck.IsAvailable) {
+        throw $skuCheck.Message
+    }
+    Write-Host "  [✓] $skuToValidate available in zone $TargetZone" -ForegroundColor Green
+}
+
+Write-Host ""
+Write-Success "Target configuration validated."
 
 #endregion
 
-#region Step 6: Check for Proximity Placement Group
-Write-StepHeader "6" "Check for Proximity Placement Group"
+#region Step 3: Check for Proximity Placement Group
+Write-StepHeader "3" "Check for Proximity Placement Group"
 
 # Script-level variable to store validated PPG for VM creation
 $script:targetPPGObject = $null
@@ -1467,8 +1445,17 @@ if ($sourcePPGId) {
             if ($nonSourceVMs.Count -gt 0) {
                 Write-Info "PPG '$sourcePpgName' contains other VMs:"
                 foreach ($ppgVm in $nonSourceVMs) {
-                    $stateInfo = if ($ppgVm.IsRunning) { ", Running" } else { ", Stopped" }
-                    Write-Detail "  - $($ppgVm.Name) (Zone: $($ppgVm.Zone)$stateInfo)"
+                    $zoneText = $ppgVm.Zone -eq "Regional" ? "Regional" : "Zone $($ppgVm.Zone)"
+                    if ($ppgVm.IsRunning) {
+                        Write-Host "     - $($ppgVm.Name) ($zoneText, " -NoNewline -ForegroundColor Gray
+                        Write-Host "Running" -NoNewline -ForegroundColor Green
+                        Write-Host ")" -ForegroundColor Gray
+                    }
+                    else {
+                        Write-Host "     - $($ppgVm.Name) ($zoneText, " -NoNewline -ForegroundColor Gray
+                        Write-Host "Deallocated" -NoNewline -ForegroundColor DarkGray
+                        Write-Host ")" -ForegroundColor Gray
+                    }
                 }
             }
             else {
@@ -1486,7 +1473,15 @@ if ($sourcePPGId) {
                 Write-Success "PPG '$sourcePpgName' is pinned to Zone $($ppgCheck.PinnedZone) - compatible with target Zone $TargetZone."
             }
             else {
-                Write-Success "PPG '$sourcePpgName' is not yet pinned to a zone - will be pinned to Zone $TargetZone."
+                # Check if there are any regional (non-zonal) VMs that are deallocated
+                $regionalVMs = @($ppgCheck.VMsInPPG | Where-Object { $_.Zone -eq "Regional" -and -not $_.IsSource })
+                if ($regionalVMs.Count -gt 0) {
+                    Write-Success "PPG '$sourcePpgName' has regional VMs but all are deallocated - PPG is not pinned."
+                    Write-Detail "  The PPG will be pinned to Zone $TargetZone when the new VM is created."
+                }
+                else {
+                    Write-Success "PPG '$sourcePpgName' is not yet pinned to a zone - will be pinned to Zone $TargetZone."
+                }
             }
             Write-Success "New VM will be assigned to PPG '$sourcePpgName'."
             $script:targetPPGObject = $sourcePPG
@@ -1501,16 +1496,11 @@ if ($sourcePPGId) {
                 Write-Host "║                    PPG PHYSICAL PINNING CONFLICT                             ║" -ForegroundColor Red
                 Write-Host "╚══════════════════════════════════════════════════════════════════════════════╝" -ForegroundColor Red
                 Write-Host ""
-                Write-Host "  PPG '$sourcePpgName' has running regional (non-zonal) VMs:" -ForegroundColor Yellow
-                foreach ($runningVm in $ppgCheck.RunningRegionalVMs) {
-                    Write-Host "    - $runningVm" -ForegroundColor Yellow
-                }
-                Write-Host ""
                 Write-Host "  Running regional VMs physically pin the PPG to specific hardware." -ForegroundColor White
                 Write-Host "  This hardware may not be in the target Zone $TargetZone." -ForegroundColor White
                 Write-Host ""
                 Write-Host "  ACTION REQUIRED:" -ForegroundColor Cyan
-                Write-Host "    Stop (deallocate) the regional VMs listed above, then re-run this script." -ForegroundColor White
+                Write-Host "    Stop (deallocate) the running regional VMs listed above, then re-run this script." -ForegroundColor White
                 Write-Host ""
                 throw "Cannot proceed: PPG '$sourcePpgName' has running regional VMs that physically pin it. Stop these VMs first."
             }
@@ -1552,8 +1542,8 @@ else {
 
 #endregion
 
-#region Step 7: Stop Source VM (for consistent snapshots)
-Write-StepHeader "7" "Stop Source VM"
+#region Step 4: Stop Source VM (for consistent snapshots)
+Write-StepHeader "4" "Stop Source VM"
 
 $vmStatus = ($vm.Statuses | Where-Object { $_.Code -like 'PowerState/*' }).Code
 Write-Detail "Current power state: $vmStatus"
@@ -1574,8 +1564,8 @@ else {
 
 #endregion
 
-#region Step 8: Create VM Restore Point
-Write-StepHeader "8" "Create VM Restore Point"
+#region Step 5: Create VM Restore Point
+Write-StepHeader "5" "Create VM Restore Point"
 
 # Generate unique names for restore point collection and restore point
 $timestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
@@ -1627,8 +1617,8 @@ Write-Success "VM restore point created."
 
 #endregion
 
-#region Step 9: Create Zonal Disks from Restore Points
-Write-StepHeader "9" "Create Zonal Disks from Restore Points"
+#region Step 6: Create Zonal Disks from Restore Points
+Write-StepHeader "6" "Create Zonal Disks from Restore Points"
 
 $newDisks = @{
     OsDisk    = $null
@@ -1842,8 +1832,8 @@ Write-Success "All zonal disks created."
 
 #endregion
 
-#region Step 10: Create New NIC
-Write-StepHeader "10" "Create New NIC"
+#region Step 7: Create New NIC
+Write-StepHeader "7" "Create New NIC"
 
 # Use a different NIC name if same resource group to avoid conflict
 $newNicName = if ($sameResourceGroup) {
@@ -1874,8 +1864,8 @@ else {
 
 #endregion
 
-#region Step 11: Create New VM
-Write-StepHeader "11" "Create New Zonal VM"
+#region Step 8: Create New VM
+Write-StepHeader "8" "Create New Zonal VM"
 
 if ($PSCmdlet.ShouldProcess($NewVMName, "Create zonal VM in zone $TargetZone")) {
     # Create VM configuration - include PPG if specified
@@ -2086,8 +2076,8 @@ else {
 
 #endregion
 
-#region Step 12: List Source VM Extensions
-Write-StepHeader "12" "Source VM Extensions"
+#region Step 9: List Source VM Extensions
+Write-StepHeader "9" "Source VM Extensions"
 
 if ($sourceExtensions -and $sourceExtensions.Count -gt 0) {
     Write-Warning "The source VM had the following extensions installed:"
@@ -2108,8 +2098,8 @@ else {
 
 #endregion
 
-#region Step 13: Cleanup Restore Point Collection
-Write-StepHeader "13" "Cleanup Restore Point Collection"
+#region Step 10: Cleanup Restore Point Collection
+Write-StepHeader "10" "Cleanup Restore Point Collection"
 
 if ($PSCmdlet.ShouldProcess("Restore Point Collection", "Delete temporary restore point collection")) {
     # Delete the restore point collection (this also deletes all restore points within it)
@@ -2179,7 +2169,7 @@ if ($sourcePPGId -and -not $script:targetPPGObject) {
     Write-Host "  - New VM was NOT added to source PPG (zone incompatibility)" -ForegroundColor Yellow
 }
 if ($sourceExtensions -and $sourceExtensions.Count -gt 0) {
-    Write-Host "  - Extensions from the source VM were NOT installed (see Step 12)" -ForegroundColor Yellow
+    Write-Host "  - Extensions from the source VM were NOT installed (see Step 9)" -ForegroundColor Yellow
 }
 Write-Host "  - Review the new VM before deleting the source resources" -ForegroundColor White
 Write-Host "`n"
