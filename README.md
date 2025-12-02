@@ -9,16 +9,19 @@ This script safely copies an Azure VM (regional or zonal) to a specified availab
 ### What the Script Does
 
 1. **Validates** the source VM, target resource group, zone availability, and encryption status
-2. **Checks VM restore point compatibility** and warns about unsupported disk types
-3. **Checks for Azure Disk Encryption (ADE)** and blocks if detected (ADE-encrypted disks cannot be copied)
-4. **Stops** the source VM for consistent restore points
-5. **Creates a VM restore point** with all disks (multi-disk consistent)
-6. **Creates new zonal disks** from the disk restore points in the target resource group
-7. **Optionally converts disk SKUs** during migration (e.g., Premium to Standard)
-8. **Creates a new NIC** with all configurations copied from the source
-9. **Creates the new VM** in the target availability zone
-10. **Cleans up** the temporary restore point collection
-11. **Reports** any VM extensions that need manual installation
+2. **Displays disk inventory** showing SKU, size, zone status, and encryption type for all disks
+3. **Checks VM restore point compatibility** and warns about unsupported disk types
+4. **Checks for Azure Disk Encryption (ADE)** and blocks if detected (ADE-encrypted disks cannot be copied)
+5. **Validates Proximity Placement Group** constraints and blocks if incompatible
+6. **Shows physical zone mapping** (logical zone → physical datacenter)
+7. **Stops** the source VM for consistent restore points
+8. **Creates a VM restore point** with all disks (multi-disk consistent)
+9. **Creates new zonal disks** from the disk restore points in the target resource group
+10. **Optionally converts disk SKUs** during migration (e.g., Premium to Standard)
+11. **Creates a new NIC** with all configurations copied from the source
+12. **Creates the new VM** in the target availability zone
+13. **Cleans up** the temporary restore point collection
+14. **Reports** any VM extensions that need manual installation
 
 ## Requirements
 
@@ -45,7 +48,8 @@ Install-Module -Name Az.Compute, Az.Network, Az.Resources -Scope CurrentUser
 ```powershell
 .\move-vmtozone.ps1 -ResourceGroupName <source-rg> -VMName <vm-name> `
     -TargetZone <1|2|3> [-TargetResourceGroupName <target-rg>] `
-    [-NewVMName <new-vm-name>] [-TargetOsDiskSku <sku>] [-TargetDataDiskSku <sku>] [-WhatIf]
+    [-NewVMName <new-vm-name>] [-TargetOsDiskSku <sku>] [-TargetDataDiskSku <sku>] `
+    [-ParallelDiskCreation <1-16>] [-WhatIf]
 ```
 
 ### Parameters
@@ -137,6 +141,40 @@ Before running the script:
 
 ## Features
 
+### Disk Inventory Display
+
+The script displays a detailed inventory of all disks before migration:
+
+```
+  DISK INVENTORY
+  ──────────────────────────────────────────────────────────────────────────────
+  OS Disk:
+    my-vm-osdisk
+      SKU: Premium_LRS | Size: 128 GB | Zone 1 | Encryption: SSE+PMK
+  Data Disks (3):
+    LUN 0: my-vm-data01 | Premium_LRS | 512 GB | Zone 1 | SSE+CMK
+    LUN 1: my-vm-data02 | StandardSSD_LRS | 256 GB | Regional | SSE+PMK
+    LUN 2: my-vm-data03 | Premium_LRS | 1000 GB | Zone 1 | SSE+CMK
+```
+
+- **SKU**: Disk storage type
+- **Size**: Disk capacity in GB
+- **Zone**: Shows `Zone 1/2/3` for zonal disks or `Regional` for non-zonal disks
+- **Encryption**: `SSE+PMK` (Platform-Managed Keys) or `SSE+CMK` (Customer-Managed Keys via Disk Encryption Set)
+
+### Physical Zone Mapping
+
+The script displays the physical zone that corresponds to your target logical zone:
+
+```
+  ZONE MAPPING INFORMATION
+  Target Logical Zone  : 2
+  Physical Zone        : eastus-az2
+  Location             : eastus
+```
+
+> **Note:** Physical zones are shared across subscriptions with the same zone mapping. Different subscriptions may have different logical-to-physical zone mappings.
+
 ### Preserved Configurations
 
 The script preserves the following from the source VM:
@@ -191,15 +229,20 @@ The script uses VM restore points instead of individual snapshots. This provides
 
 - **Azure Disk Encryption (ADE):** The script detects and blocks VMs encrypted with ADE (BitLocker/dm-crypt). ADE-encrypted disks cannot be copied to a new VM without becoming inaccessible.
 - **Encryption at Host:** This setting IS preserved and copied to the new VM.
+- **Disk Encryption Sets (SSE+CMK):** Server-side encryption with customer-managed keys is fully preserved.
 
 ### Proximity Placement Group (PPG) Support
 
-The script intelligently handles PPGs:
+The script enforces strict PPG constraints to prevent deployment failures:
 
-- ✅ Uses source PPG if it's compatible with the target zone
-- ✅ Uses source PPG if not yet pinned to any zone
-- ⚠️ Skips PPG assignment if pinned to a different zone
-- ⚠️ Skips PPG assignment if running regional VMs would cause conflicts
+| PPG Scenario | Behavior |
+|--------------|----------|
+| PPG is compatible with target zone | ✅ Uses source PPG |
+| PPG not yet pinned to any zone | ✅ Uses source PPG (becomes pinned to target zone) |
+| PPG pinned to a different zone | ❌ **Script stops** — Use `-TargetZone` matching the PPG zone |
+| PPG has running regional VMs | ❌ **Script stops** — Stop those VMs first, then retry |
+
+> **Note:** Unlike previous versions that would skip PPG assignment with a warning, the script now stops and requires you to resolve PPG conflicts before proceeding.
 
 ## Limitations
 
@@ -213,6 +256,7 @@ The script intelligently handles PPGs:
 | **No Ultra SSD/Premium v2** | Crash-consistent restore points don't support these disk types |
 | **No Ephemeral/Shared disks** | Ephemeral OS disks and shared disks are not supported |
 | **Same RG requires new name** | If target RG equals source RG, NewVMName must be different |
+| **PPG constraints enforced** | Script stops if PPG is incompatible with target zone |
 
 ## IP Address Handling
 
@@ -226,8 +270,10 @@ The new VM will receive a **different IP address** assigned dynamically by Azure
 
 ## Output
 
-The script provides detailed progress information and a final summary showing:
+The script provides detailed progress information including:
 
+- **Disk inventory** with SKU, size, zone, and encryption details
+- **Physical zone mapping** showing which datacenter the logical zone maps to
 - Source VM and resource details (unchanged)
 - New VM and resource details (created)
 - Disk SKUs (original and converted if applicable)
@@ -270,6 +316,16 @@ The script provides detailed progress information and a final summary showing:
 
 **"Restore point creation timeout"**
 - For large disks, the restore point may take longer; it will retry automatically
+
+**"PPG is pinned to zone X but target is zone Y"**
+- Change `-TargetZone` to match the PPG's pinned zone, or remove the VM from the PPG before migration
+
+**"PPG has running regional VMs"**
+- Stop all regional VMs in the PPG before running the script, then retry
+
+**"Could not determine physical zone mapping"**
+- This is informational only and doesn't block the migration
+- May occur if the region doesn't support zone mappings or due to API limitations
 
 ## License
 
