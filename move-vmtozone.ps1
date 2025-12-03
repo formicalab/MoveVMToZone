@@ -2142,9 +2142,10 @@ if ($PSCmdlet.ShouldProcess($NewVMName, "Create zonal VM in zone $TargetZone")) 
         }
         elseif ($vmConfig.Identity.UserAssignedIdentities -and $vmConfig.Identity.UserAssignedIdentities.Count -gt 0) {
             # Build user identities dictionary for UserAssigned or SystemAssigned+UserAssigned
-            $userIdentities = @{}
+            # Must use proper .NET Dictionary type, not PowerShell hashtable
+            $userIdentities = New-Object 'System.Collections.Generic.Dictionary[string,Microsoft.Azure.Management.Compute.Models.UserAssignedIdentitiesValue]'
             foreach ($identityId in $vmConfig.Identity.UserAssignedIdentities.Keys) {
-                $userIdentities[$identityId] = New-Object Microsoft.Azure.Management.Compute.Models.UserAssignedIdentitiesValue
+                $userIdentities.Add($identityId, (New-Object Microsoft.Azure.Management.Compute.Models.UserAssignedIdentitiesValue))
             }
             $newVmConfig.Identity.UserAssignedIdentities = $userIdentities
             
