@@ -145,15 +145,74 @@ $ErrorActionPreference = 'Stop'
 
 #region Helper Functions
 
+function Write-Log {
+    <#
+    .SYNOPSIS
+        Centralized logging function that outputs to console with timestamp and optional color.
+    .DESCRIPTION
+        All log messages go through this function, making it easy to add file logging later.
+    .PARAMETER Message
+        The message to log.
+    .PARAMETER Level
+        The log level: Info, Success, Warning, Error, Detail, Header.
+    .PARAMETER ForegroundColor
+        The color for console output.
+    .PARAMETER NoTimestamp
+        If specified, omits the timestamp (useful for headers and separators).
+    .PARAMETER NoNewline
+        If specified, does not append a newline at the end.
+    #>
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Message,
+        
+        [Parameter(Mandatory = $false)]
+        [ValidateSet('Info', 'Success', 'Warning', 'Error', 'Detail', 'Header')]
+        [string]$Level = 'Info',
+        
+        [Parameter(Mandatory = $false)]
+        [System.ConsoleColor]$ForegroundColor = [System.ConsoleColor]::White,
+        
+        [Parameter(Mandatory = $false)]
+        [switch]$NoTimestamp,
+        
+        [Parameter(Mandatory = $false)]
+        [switch]$NoNewline
+    )
+    
+    $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+    
+    if ($NoTimestamp) {
+        $formattedMessage = $Message
+    } else {
+        $formattedMessage = "[$timestamp] $Message"
+    }
+    
+    # Console output
+    $writeHostParams = @{
+        Object = $formattedMessage
+        ForegroundColor = $ForegroundColor
+    }
+    if ($NoNewline) {
+        $writeHostParams.NoNewline = $true
+    }
+    Write-Host @writeHostParams
+    
+    # Future: Add file logging here
+    # if ($script:LogFile) {
+    #     $formattedMessage | Out-File -FilePath $script:LogFile -Append -Encoding UTF8
+    # }
+}
+
 function Write-StepHeader {
     <#
     .SYNOPSIS
         Writes a formatted step header to the console.
     #>
     param([string]$StepNumber, [string]$Title)
-    Write-Host "`n$('=' * 80)" -ForegroundColor Cyan
-    Write-Host "STEP $StepNumber : $Title" -ForegroundColor Cyan
-    Write-Host "$('=' * 80)" -ForegroundColor Cyan
+    Write-Log -Message "`n$('=' * 80)" -ForegroundColor Cyan -NoTimestamp
+    Write-Log -Message "STEP $StepNumber : $Title" -Level Header -ForegroundColor Cyan
+    Write-Log -Message "$('=' * 80)" -ForegroundColor Cyan -NoTimestamp
 }
 
 function Write-Success {
@@ -162,7 +221,7 @@ function Write-Success {
         Writes a success message in green.
     #>
     param([string]$Message)
-    Write-Host "[SUCCESS] $Message" -ForegroundColor Green
+    Write-Log -Message "[SUCCESS] $Message" -Level Success -ForegroundColor Green
 }
 
 function Write-Info {
@@ -171,7 +230,7 @@ function Write-Info {
         Writes an info message in cyan.
     #>
     param([string]$Message)
-    Write-Host "[INFO] $Message" -ForegroundColor Cyan
+    Write-Log -Message "[INFO] $Message" -Level Info -ForegroundColor Cyan
 }
 
 function Write-Detail {
@@ -180,7 +239,7 @@ function Write-Detail {
         Writes a detail message in gray with indentation.
     #>
     param([string]$Message)
-    Write-Host "  $Message" -ForegroundColor Gray
+    Write-Log -Message "  $Message" -Level Detail -ForegroundColor Gray
 }
 
 function Get-PhysicalZone {
