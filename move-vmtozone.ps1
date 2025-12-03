@@ -792,24 +792,25 @@ function New-ZonalDiskFromRestorePoint {
         [int]$MaxRetries = 3
     )
     
-    # Build disk config with encryption if specified
+    # Build disk config parameters
+    $diskConfigParams = @{
+        Location         = $Location
+        Zone             = $Zone
+        SkuName          = $SkuName
+        CreateOption     = 'Restore'
+        SourceResourceId = $DiskRestorePointId
+    }
+    
     if ($DiskEncryptionSetId) {
-        $diskConfig = New-AzDiskConfig `
-            -Location $Location `
-            -Zone $Zone `
-            -SkuName $SkuName `
-            -CreateOption Restore `
-            -SourceResourceId $DiskRestorePointId `
-            -DiskEncryptionSetId $DiskEncryptionSetId
+        $diskConfigParams.DiskEncryptionSetId = $DiskEncryptionSetId
     }
-    else {
-        $diskConfig = New-AzDiskConfig `
-            -Location $Location `
-            -Zone $Zone `
-            -SkuName $SkuName `
-            -CreateOption Restore `
-            -SourceResourceId $DiskRestorePointId
+    
+    # Pass Tags via -Tag parameter to avoid null array indexing issue
+    if ($Tags -and $Tags.Count -gt 0) {
+        $diskConfigParams.Tag = $Tags
     }
+    
+    $diskConfig = New-AzDiskConfig @diskConfigParams
     
     if ($DiskSizeGB -and $DiskSizeGB -gt 0) {
         $diskConfig.DiskSizeGB = $DiskSizeGB
@@ -832,15 +833,6 @@ function New-ZonalDiskFromRestorePoint {
             Write-Warning "Cannot set LogicalSectorSize - CreationData is null"
         } else {
             $diskConfig.CreationData.LogicalSectorSize = $LogicalSectorSize
-        }
-    }
-    
-    if ($Tags -and $Tags.Count -gt 0) {
-        if ($null -eq $diskConfig.Tags) {
-            $diskConfig.Tags = @{}
-        }
-        foreach ($key in $Tags.Keys) {
-            $diskConfig.Tags[$key] = $Tags[$key]
         }
     }
     
@@ -1848,6 +1840,10 @@ if ($diskInfo.DataDisks.Count -gt 0) {
                 if ($params.DiskEncryptionSetId) {
                     $diskConfigParams.DiskEncryptionSetId = $params.DiskEncryptionSetId
                 }
+                # Pass Tags via -Tag parameter to avoid null array indexing issue
+                if ($params.Tags -and $params.Tags.Count -gt 0) {
+                    $diskConfigParams.Tag = $params.Tags
+                }
                 
                 $diskConfig = New-AzDiskConfig @diskConfigParams
                 
@@ -1868,15 +1864,6 @@ if ($diskInfo.DataDisks.Count -gt 0) {
                         $diskConfig.CreationData.LogicalSectorSize = $params.LogicalSectorSize
                     }
                 }
-                if ($params.Tags -and $params.Tags.Count -gt 0) {
-                    if ($null -eq $diskConfig.Tags) {
-                        $diskConfig.Tags = @{}
-                    }
-                    foreach ($key in $params.Tags.Keys) {
-                        $diskConfig.Tags[$key] = $params.Tags[$key]
-                    }
-                }
-                
                 # Check if disk already exists
                 $existingDisk = Get-AzDisk -ResourceGroupName $params.TargetResourceGroupName -DiskName $params.NewDiskName -ErrorAction SilentlyContinue
                 if ($existingDisk) {
@@ -1943,7 +1930,8 @@ if ($diskInfo.DataDisks.Count -gt 0) {
         else {
             # Sequential disk creation (original behavior)
             foreach ($job in $dataDiskJobs) {
-                $newDataDisk = New-ZonalDiskFromRestorePoint @($job.Params)
+                $diskParams = $job.Params
+                $newDataDisk = New-ZonalDiskFromRestorePoint @diskParams
                 $newDisks.DataDisks += @{
                     Disk    = $newDataDisk
                     Lun     = $job.Lun
