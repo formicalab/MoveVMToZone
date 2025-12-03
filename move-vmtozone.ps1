@@ -265,38 +265,65 @@ function Get-VMDiskInfo {
         [Microsoft.Azure.Commands.Compute.Models.PSVirtualMachine]$VM
     )
     
+    # Validate VM storage profile
+    if ($null -eq $VM.StorageProfile) {
+        throw "VM StorageProfile is null. Cannot retrieve disk information."
+    }
+    
+    if ($null -eq $VM.StorageProfile.OsDisk -or [string]::IsNullOrEmpty($VM.StorageProfile.OsDisk.Name)) {
+        throw "VM OS disk information is missing or invalid."
+    }
+    
     # Get OS disk details
-    $osDisk = Get-AzDisk -ResourceGroupName $VM.ResourceGroupName -DiskName $VM.StorageProfile.OsDisk.Name
+    $osDisk = Get-AzDisk -ResourceGroupName $VM.ResourceGroupName -DiskName $VM.StorageProfile.OsDisk.Name -ErrorAction Stop
+    if ($null -eq $osDisk) {
+        throw "Could not retrieve OS disk '$($VM.StorageProfile.OsDisk.Name)' from resource group '$($VM.ResourceGroupName)'"
+    }
+    
     $osDiskInfo = @{
         Name                 = $VM.StorageProfile.OsDisk.Name
-        Caching              = $VM.StorageProfile.OsDisk.Caching.ToString()
-        OsType               = $VM.StorageProfile.OsDisk.OsType.ToString()
+        Caching              = if ($VM.StorageProfile.OsDisk.Caching) { $VM.StorageProfile.OsDisk.Caching.ToString() } else { 'None' }
+        OsType               = if ($VM.StorageProfile.OsDisk.OsType) { $VM.StorageProfile.OsDisk.OsType.ToString() } else { 'Windows' }
         Sku                  = $osDisk.Sku.Name
         DiskSizeGB           = $osDisk.DiskSizeGB
         DiskIOPSReadWrite    = $osDisk.DiskIOPSReadWrite
         DiskMBpsReadWrite    = $osDisk.DiskMBpsReadWrite
         Tier                 = $osDisk.Tier
-        LogicalSectorSize    = $osDisk.CreationData.LogicalSectorSize
+        LogicalSectorSize    = if ($osDisk.CreationData) { $osDisk.CreationData.LogicalSectorSize } else { $null }
         DiskEncryptionSetId  = $osDisk.Encryption?.DiskEncryptionSetId
         Zones                = $osDisk.Zones
+        Tags                 = $osDisk.Tags
     }
     
     # Get data disk details
     $dataDisksInfo = @()
-    foreach ($dataDisk in $VM.StorageProfile.DataDisks) {
-        $disk = Get-AzDisk -ResourceGroupName $VM.ResourceGroupName -DiskName $dataDisk.Name
-        $dataDisksInfo += @{
-            Name                 = $dataDisk.Name
-            Lun                  = $dataDisk.Lun
-            Caching              = $dataDisk.Caching.ToString()
-            Sku                  = $disk.Sku.Name
-            DiskSizeGB           = $disk.DiskSizeGB
-            DiskIOPSReadWrite    = $disk.DiskIOPSReadWrite
-            DiskMBpsReadWrite    = $disk.DiskMBpsReadWrite
-            Tier                 = $disk.Tier
-            LogicalSectorSize    = $disk.CreationData.LogicalSectorSize
-            DiskEncryptionSetId  = $disk.Encryption?.DiskEncryptionSetId
-            Zones                = $disk.Zones
+    if ($VM.StorageProfile.DataDisks -and $VM.StorageProfile.DataDisks.Count -gt 0) {
+        foreach ($dataDisk in $VM.StorageProfile.DataDisks) {
+            if ([string]::IsNullOrEmpty($dataDisk.Name)) {
+                Write-Warning "Skipping data disk at LUN $($dataDisk.Lun) - disk name is empty"
+                continue
+            }
+            
+            $disk = Get-AzDisk -ResourceGroupName $VM.ResourceGroupName -DiskName $dataDisk.Name -ErrorAction SilentlyContinue
+            if ($null -eq $disk) {
+                Write-Warning "Could not retrieve data disk '$($dataDisk.Name)' - skipping"
+                continue
+            }
+            
+            $dataDisksInfo += @{
+                Name                 = $dataDisk.Name
+                Lun                  = $dataDisk.Lun
+                Caching              = if ($dataDisk.Caching) { $dataDisk.Caching.ToString() } else { 'None' }
+                Sku                  = $disk.Sku.Name
+                DiskSizeGB           = $disk.DiskSizeGB
+                DiskIOPSReadWrite    = $disk.DiskIOPSReadWrite
+                DiskMBpsReadWrite    = $disk.DiskMBpsReadWrite
+                Tier                 = $disk.Tier
+                LogicalSectorSize    = if ($disk.CreationData) { $disk.CreationData.LogicalSectorSize } else { $null }
+                DiskEncryptionSetId  = $disk.Encryption?.DiskEncryptionSetId
+                Zones                = $disk.Zones
+                Tags                 = $disk.Tags
+            }
         }
     }
     
@@ -615,31 +642,52 @@ function Get-DiskRestorePointIds {
         -Name $RestorePointName `
         -InstanceView
     
+    if ($null -eq $restorePoint) {
+        throw "Failed to retrieve restore point '$RestorePointName' from collection '$CollectionName'"
+    }
+    
     $diskRestorePoints = @{}
     
     # The restore point contains SourceMetadata.StorageProfile with disk info
     # And the disk restore points in the SourceRestorePoint.DiskRestorePoints collection
     
-    if ($restorePoint.SourceMetadata -and $restorePoint.SourceMetadata.StorageProfile) {
-        $storageProfile = $restorePoint.SourceMetadata.StorageProfile
-        
-        # Map OS disk
-        if ($storageProfile.OsDisk -and $storageProfile.OsDisk.DiskRestorePoint) {
-            $osDiskName = $SourceVM.StorageProfile.OsDisk.Name
+    if ($null -eq $restorePoint.SourceMetadata) {
+        Write-Warning "Restore point SourceMetadata is null. Restore point may not have completed successfully."
+        Write-Warning "Restore point provisioning state: $($restorePoint.ProvisioningState)"
+        return $diskRestorePoints
+    }
+    
+    if ($null -eq $restorePoint.SourceMetadata.StorageProfile) {
+        Write-Warning "Restore point StorageProfile is null. Restore point may not have captured disk information."
+        return $diskRestorePoints
+    }
+    
+    $storageProfile = $restorePoint.SourceMetadata.StorageProfile
+    
+    # Map OS disk
+    if ($storageProfile.OsDisk -and $storageProfile.OsDisk.DiskRestorePoint) {
+        $osDiskName = $SourceVM.StorageProfile.OsDisk.Name
+        if ([string]::IsNullOrEmpty($osDiskName)) {
+            Write-Warning "Source VM OS disk name is null or empty"
+        } else {
             $diskRestorePoints[$osDiskName] = $storageProfile.OsDisk.DiskRestorePoint.Id
             Write-Detail "  OS Disk: $osDiskName"
         }
-        
-        # Map data disks
-        if ($storageProfile.DataDisks) {
-            foreach ($dataDisk in $storageProfile.DataDisks) {
-                if ($dataDisk.DiskRestorePoint) {
-                    # Find matching source disk by LUN
-                    $sourceDisk = $SourceVM.StorageProfile.DataDisks | Where-Object { $_.Lun -eq $dataDisk.Lun }
-                    if ($sourceDisk) {
-                        $diskRestorePoints[$sourceDisk.Name] = $dataDisk.DiskRestorePoint.Id
-                        Write-Detail "  Data Disk (LUN $($dataDisk.Lun)): $($sourceDisk.Name)"
-                    }
+    } else {
+        Write-Warning "OS disk restore point not found in restore point metadata"
+    }
+    
+    # Map data disks
+    if ($storageProfile.DataDisks -and $storageProfile.DataDisks.Count -gt 0) {
+        foreach ($dataDisk in $storageProfile.DataDisks) {
+            if ($dataDisk.DiskRestorePoint) {
+                # Find matching source disk by LUN
+                $sourceDisk = $SourceVM.StorageProfile.DataDisks | Where-Object { $_.Lun -eq $dataDisk.Lun }
+                if ($sourceDisk) {
+                    $diskRestorePoints[$sourceDisk.Name] = $dataDisk.DiskRestorePoint.Id
+                    Write-Detail "  Data Disk (LUN $($dataDisk.Lun)): $($sourceDisk.Name)"
+                } else {
+                    Write-Warning "Could not find source disk matching LUN $($dataDisk.Lun)"
                 }
             }
         }
@@ -721,10 +769,17 @@ function New-ZonalDiskFromRestorePoint {
     }
     
     if ($LogicalSectorSize -and $LogicalSectorSize -gt 0) {
-        $diskConfig.CreationData.LogicalSectorSize = $LogicalSectorSize
+        if ($null -eq $diskConfig.CreationData) {
+            Write-Warning "Cannot set LogicalSectorSize - CreationData is null"
+        } else {
+            $diskConfig.CreationData.LogicalSectorSize = $LogicalSectorSize
+        }
     }
     
     if ($Tags -and $Tags.Count -gt 0) {
+        if ($null -eq $diskConfig.Tags) {
+            $diskConfig.Tags = @{}
+        }
         foreach ($key in $Tags.Keys) {
             $diskConfig.Tags[$key] = $Tags[$key]
         }
@@ -840,6 +895,7 @@ function Get-ZonalDiskParams {
     <#
     .SYNOPSIS
         Builds parameter hashtable for New-ZonalDiskFromRestorePoint, adding optional params only if present.
+        Tags are taken from DiskInfo.Tags (the disk's own tags).
     #>
     param(
         [Parameter(Mandatory)] [string]$DiskRestorePointId,
@@ -850,7 +906,6 @@ function Get-ZonalDiskParams {
         [Parameter(Mandatory)] [string]$SkuName,
         [string]$SourceSkuName,
         [hashtable]$DiskInfo,
-        [hashtable]$Tags,
         [int]$MaxRetries = 3
     )
     
@@ -881,7 +936,10 @@ function Get-ZonalDiskParams {
         }
     }
     
-    if ($Tags) { $params.Tags = $Tags }
+    # Copy the disk's own tags (if any) - no fallback to VM tags
+    if ($DiskInfo.Tags -and $DiskInfo.Tags.Count -gt 0) {
+        $params.Tags = $DiskInfo.Tags
+    }
     
     return $params
 }
@@ -963,8 +1021,8 @@ function Copy-NetworkInterfaceConfig {
         $nicParams.NetworkSecurityGroupId = $SourceNicConfig.NetworkSecurityGroupId
     }
     
-    # Add tags
-    if ($SourceNicConfig.Tags) {
+    # Add tags (only if they exist and have values)
+    if ($SourceNicConfig.Tags -and $SourceNicConfig.Tags.Count -gt 0) {
         $nicParams.Tag = $SourceNicConfig.Tags
     }
     
@@ -1626,6 +1684,16 @@ $newDisks = @{
 }
 
 if ($PSCmdlet.ShouldProcess("OS Disk", "Create zonal disk in zone $TargetZone")) {
+    # Validate that disk restore points were retrieved
+    if ($null -eq $restorePointData.DiskRestorePoints -or $restorePointData.DiskRestorePoints.Count -eq 0) {
+        throw "No disk restore points were retrieved. The restore point may not have been created successfully or the SourceMetadata is missing."
+    }
+    
+    # Validate OS disk info exists
+    if ($null -eq $diskInfo -or $null -eq $diskInfo.OsDisk -or [string]::IsNullOrEmpty($diskInfo.OsDisk.Name)) {
+        throw "OS disk information is missing or invalid. Cannot proceed with disk creation."
+    }
+    
     # Determine new disk name - use suffix if same RG to avoid conflict
     $newOsDiskName = if ($sameResourceGroup) {
         "$($diskInfo.OsDisk.Name)-z$TargetZone"
@@ -1639,6 +1707,7 @@ if ($PSCmdlet.ShouldProcess("OS Disk", "Create zonal disk in zone $TargetZone"))
     # Get disk restore point ID for OS disk
     $osDiskRpId = $restorePointData.DiskRestorePoints[$diskInfo.OsDisk.Name]
     if (-not $osDiskRpId) {
+        Write-Warning "Available disk restore points: $($restorePointData.DiskRestorePoints.Keys -join ', ')"
         throw "Could not find disk restore point for OS disk '$($diskInfo.OsDisk.Name)'"
     }
     
@@ -1650,8 +1719,7 @@ if ($PSCmdlet.ShouldProcess("OS Disk", "Create zonal disk in zone $TargetZone"))
         -Zone $TargetZone `
         -SkuName $osDiskTargetSku `
         -SourceSkuName $diskInfo.OsDisk.Sku `
-        -DiskInfo $diskInfo.OsDisk `
-        -Tags $vmConfig.Tags
+        -DiskInfo $diskInfo.OsDisk
     
     $newDisks.OsDisk = New-ZonalDiskFromRestorePoint @osDiskParams
 }
@@ -1695,8 +1763,7 @@ if ($diskInfo.DataDisks.Count -gt 0) {
                     -Zone $TargetZone `
                     -SkuName $dataDiskTargetSku `
                     -SourceSkuName $dataDisk.Sku `
-                    -DiskInfo $dataDisk `
-                    -Tags $vmConfig.Tags
+                    -DiskInfo $dataDisk
             }
         }
         
@@ -1738,9 +1805,14 @@ if ($diskInfo.DataDisks.Count -gt 0) {
                     $diskConfig.Tier = $params.Tier
                 }
                 if ($params.LogicalSectorSize -and $params.LogicalSectorSize -gt 0) {
-                    $diskConfig.CreationData.LogicalSectorSize = $params.LogicalSectorSize
+                    if ($null -ne $diskConfig.CreationData) {
+                        $diskConfig.CreationData.LogicalSectorSize = $params.LogicalSectorSize
+                    }
                 }
                 if ($params.Tags -and $params.Tags.Count -gt 0) {
+                    if ($null -eq $diskConfig.Tags) {
+                        $diskConfig.Tags = @{}
+                    }
                     foreach ($key in $params.Tags.Keys) {
                         $diskConfig.Tags[$key] = $params.Tags[$key]
                     }
@@ -2040,6 +2112,9 @@ if ($PSCmdlet.ShouldProcess($NewVMName, "Create zonal VM in zone $TargetZone")) 
     
     # Set tags
     if ($vmConfig.Tags -and $vmConfig.Tags.Count -gt 0) {
+        if ($null -eq $newVmConfig.Tags) {
+            $newVmConfig.Tags = @{}
+        }
         foreach ($key in $vmConfig.Tags.Keys) {
             $newVmConfig.Tags[$key] = $vmConfig.Tags[$key]
         }
