@@ -1987,20 +1987,26 @@ else {
 Write-StepHeader "8" "Create New Zonal VM"
 
 if ($PSCmdlet.ShouldProcess($NewVMName, "Create zonal VM in zone $TargetZone")) {
-    # Create VM configuration - include PPG if specified
-    if ($script:targetPPGObject) {
-        $newVmConfig = New-AzVMConfig `
-            -VMName $NewVMName `
-            -VMSize $vmConfig.HardwareProfile.VmSize `
-            -Zone $TargetZone `
-            -ProximityPlacementGroupId $script:targetPPGObject.Id
-        Write-Detail "VM will be assigned to PPG: $($script:targetPPGObject.Name)"
+    # Build VM config parameters - include Tags if present
+    $vmConfigParams = @{
+        VMName = $NewVMName
+        VMSize = $vmConfig.HardwareProfile.VmSize
+        Zone   = $TargetZone
     }
-    else {
-        $newVmConfig = New-AzVMConfig `
-            -VMName $NewVMName `
-            -VMSize $vmConfig.HardwareProfile.VmSize `
-            -Zone $TargetZone
+    
+    if ($script:targetPPGObject) {
+        $vmConfigParams.ProximityPlacementGroupId = $script:targetPPGObject.Id
+    }
+    
+    # Pass Tags via -Tag parameter to avoid type conversion issues
+    if ($vmConfig.Tags -and $vmConfig.Tags.Count -gt 0) {
+        $vmConfigParams.Tag = $vmConfig.Tags
+    }
+    
+    $newVmConfig = New-AzVMConfig @vmConfigParams
+    
+    if ($script:targetPPGObject) {
+        Write-Detail "VM will be assigned to PPG: $($script:targetPPGObject.Name)"
     }
     
     # Set OS disk
@@ -2155,16 +2161,6 @@ if ($PSCmdlet.ShouldProcess($NewVMName, "Create zonal VM in zone $TargetZone")) 
             elseif ($identityType -like '*UserAssigned*') {
                 $newVmConfig.Identity.Type = 'SystemAssignedUserAssigned'
             }
-        }
-    }
-    
-    # Set tags
-    if ($vmConfig.Tags -and $vmConfig.Tags.Count -gt 0) {
-        if ($null -eq $newVmConfig.Tags) {
-            $newVmConfig.Tags = @{}
-        }
-        foreach ($key in $vmConfig.Tags.Keys) {
-            $newVmConfig.Tags[$key] = $vmConfig.Tags[$key]
         }
     }
     
